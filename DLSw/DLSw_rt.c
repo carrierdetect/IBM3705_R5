@@ -732,6 +732,7 @@ int proc_DLSw(unsigned char DLSw_rbuf[], int DLSwrlen, unsigned char *DLSw_wbuf)
 void main(int argc, char *argv[]) {
    struct         sockaddr_in dlswaddr;  /* Our DLSw connection               */
    struct         sockaddr_in peeraddr;  /* Peer DLSw connection              */
+   struct         sockaddr_in inaddr;    /* Inbound peer, as accept() fills it*/
    struct         epoll_event event, events[1];
    in_addr_t      lineip;                /* DLSw line listening address       */
    int            epoll_fd;              /* Event polling socket              */
@@ -958,12 +959,23 @@ void main(int argc, char *argv[]) {
          event_count = epoll_wait(epoll_fd, events, 1, 50);
          if ((event_count > 0) && (dlsw_rfd < 1)) {
             /* Accept */
-            peerlen = sizeof(peeraddr);
-            if ((dlsw_rfd = accept(dlsw_sfd, (struct sockaddr *) &peeraddr, &peerlen)) == -1) {
+            /*
+             * accept() into its OWN struct, not into peeraddr.
+             *
+             * peeraddr holds the configured peer and DLSW_PORT, and is what
+             * the outbound connect() below aims at. accept() overwrites
+             * whatever it is given with the inbound peer's address AND ITS
+             * EPHEMERAL SOURCE PORT, so sharing the struct made the outbound
+             * connection target that port instead of 2065 -- whenever the
+             * peer connected first, which is exactly what the README's own
+             * Cisco configuration does (dlsw remote-peer 0 tcp <us>).
+             */
+            peerlen = sizeof(inaddr);
+            if ((dlsw_rfd = accept(dlsw_sfd, (struct sockaddr *) &inaddr, &peerlen)) == -1) {
                printf("\rDLSw: Inbound peer DLSw connection accept failed with %s\n", strerror(errno));
                exit(-1);
             }  // End if dlsw_rfd
-            peeraddrp = inet_ntoa(peeraddr.sin_addr);
+            peeraddrp = inet_ntoa(inaddr.sin_addr);
             printf("\rDLSw: Inbound connection from peer DLSw at %s\n", peeraddrp);
             conrfd = ON;
          }  // End if (event_count > 0)
