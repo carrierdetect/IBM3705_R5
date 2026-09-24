@@ -23,6 +23,10 @@
 */
 
 #include "sim_defs.h"
+#if defined(__GENODE__)
+extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+#endif
+extern volatile unsigned long tw_count[8];
 #include "i3705_defs.h"
 #if defined(__GENODE__)
 /* Genode has no SYS_gettid and the number is only ever printed. pthread_self
@@ -782,6 +786,7 @@ void *CA_T2_thread(void *arg) {
             if (!waiting[j])
                continue;
 
+            tw_count[4]++;
             if (!genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 100))
                continue;
 
@@ -939,6 +944,7 @@ void *CAx_thread(void *arg) {
                   whether a buffer is full without letting the signal handler
                   that fills it run: the channel then never sees a CCW, and
                   MVS halts the I/O it issued at IPL. See genode_ca.h. */
+               tw_count[3]++;
                pendingrcv = genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 10);
 #else
                ioctl(iobs[j]->bus_socket[iobs[j]->abswitch], FIONREAD, &pendingrcv);
@@ -1007,7 +1013,7 @@ void exec_ccw(struct IO3705 *iob) {
     * a real suspension and a real scheduling point. The cost is one
     * millisecond per CCW and an NCP load is 364 of them.
     */
-   usleep(1);
+   genode_pace_us(1);   /* Timer session: libc rounds this to 1.2 ms */
 #endif
    rc = read_socket_n( iob->bus_socket[iob->abswitch], (char *)iob->buffer, 8);
 
@@ -1494,8 +1500,17 @@ int Ireg_bit(int reg, int bit_mask) {
 // ************************************************************
 // This subroutine waits 1 usec
 // ************************************************************
+#include <stdint.h>
 void wait() {
+   tw_count[6]++;
+#if defined(__GENODE__)
+   /* 22 interlocks in this file call this, constantly under an NCP load.
+      libc rounds usleep(1) up to its 1 ms floor and measures ~1.2 ms; the
+      Timer session is Microseconds and measures ~0.51 ms at 500. */
+   genode_pace_us(1);
+#else
    usleep(1);
+#endif
    return;
 }
 

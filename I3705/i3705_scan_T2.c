@@ -113,6 +113,95 @@
 #endif
 
 #include "i3705_sdlc.h"
+
+/* SCANPERF: is the 12 ms cycle wakeup latency, or work?
+   Every previous measurement inferred it from the cycle RATE. This brackets
+   the pacing sleep and the rest of the cycle separately with rdtsc -- a
+   register read, because clock_gettime here cost more than the thing it was
+   measuring and may go through the timer session. */
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
+extern int16 ScanSpin;          /* deposit SCANSPIN 1 in the .cnf */
+extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+
+/* TWCOUNT: how many TIMED WAITS each thread performs per second. Inspection
+   has failed three times to say which thread degrades the scanner's sleep;
+   this counts them instead. Index: 0 scanner, 1 panel, 2 cpu, 3 CA avail10,
+   4 CA avail100, 5 LIB, 6 CA wait(). */
+volatile unsigned long tw_count[8];
+static uint64_t sp_sleep, sp_body, sp_cycles, sp_last;
+static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
+
+/* SCANSPIN=1: pace with a bounded rdtsc spin instead of a timer sleep.
+   usleep(500) measured 7-17 ms in this component -- 15-34x its argument --
+   and giving the component three CPUs did not change it, so this is not
+   contention. The spin costs CPU and keeps the emulation timing the scanner
+   exists to model; that trade is the point of the experiment. */
+static uint64_t sp_tsc_per_us;
+static void sp_calibrate(void) {
+   /* Calibrate against the CLOCK, not against the length of a sleep. The
+      first attempt divided by the sleep's ARGUMENT and got 2298 tsc/us on
+      one run and 4329 on the next, because usleep(50000) does not take
+      50 ms here -- which is the whole problem being fixed. Measuring both
+      ends makes the overrun irrelevant. */
+   struct timespec c0, c1;
+   uint64_t t0, t1, us;
+   clock_gettime(CLOCK_MONOTONIC, &c0);
+   t0 = sp_tsc();
+   usleep(100000);
+   t1 = sp_tsc();
+   clock_gettime(CLOCK_MONOTONIC, &c1);
+   us = (uint64_t)(c1.tv_sec - c0.tv_sec) * 1000000ULL
+      + (uint64_t)(c1.tv_nsec / 1000) - (uint64_t)(c0.tv_nsec / 1000);
+   sp_tsc_per_us = us ? (t1 - t0) / us : 0;
+   if (sp_tsc_per_us < 100) sp_tsc_per_us = 100;
+   printf("\rSCANPERF: calibrated %llu tsc/us over %llu us\n",
+          (unsigned long long)sp_tsc_per_us, (unsigned long long)us);
+}
+/* Characterise usleep: actual vs requested, measured on CLOCK_MONOTONIC so
+   no tsc calibration is involved. The question is whether the overrun is a
+   fixed offset (a coarse wakeup) or proportional (a slow clock). */
+static void sp_sleep_curve(void) {
+   static const unsigned req[] = { 100, 500, 1000, 5000, 10000, 50000 };
+   unsigned i;
+   printf("\rSLEEPCURVE: requested -> actual (us)\n");
+   {  /* libc vs the Timer session, in THIS component, same thread */
+      int q;
+      for (q = 0; q < 3; q++) {
+         struct timespec x, y;
+         long long lus, tus;
+         clock_gettime(CLOCK_MONOTONIC, &x);
+         usleep(500);
+         clock_gettime(CLOCK_MONOTONIC, &y);
+         lus = (long long)(y.tv_sec-x.tv_sec)*1000000LL + (y.tv_nsec-x.tv_nsec)/1000;
+         clock_gettime(CLOCK_MONOTONIC, &x);
+         genode_pace_us(500);
+         clock_gettime(CLOCK_MONOTONIC, &y);
+         tus = (long long)(y.tv_sec-x.tv_sec)*1000000LL + (y.tv_nsec-x.tv_nsec)/1000;
+         printf("\rPACECMP: libc %lld us   timer %lld us\n", lus, tus);
+      }
+   }
+   for (i = 0; i < sizeof(req)/sizeof(req[0]); i++) {
+      struct timespec a, b;
+      long long us;
+      clock_gettime(CLOCK_MONOTONIC, &a);
+      usleep(req[i]);
+      clock_gettime(CLOCK_MONOTONIC, &b);
+      us = (long long)(b.tv_sec - a.tv_sec) * 1000000LL
+         + (b.tv_nsec - a.tv_nsec) / 1000;
+      printf("\rSLEEPCURVE: %6u -> %8lld   overrun %+lld\n",
+             req[i], us, us - (long long)req[i]);
+   }
+}
+
+static void sp_pace(unsigned us) {
+   if (!sp_tsc_per_us) sp_calibrate();
+   {
+      uint64_t const deadline = sp_tsc() + (uint64_t)us * sp_tsc_per_us;
+      while (sp_tsc() < deadline) { }
+   }
+}
 #include "i3705_scanner.h"
 #include "i3705_Eregs.h"               /* External regs defs */
 #include <signal.h>
@@ -854,7 +943,48 @@ void *CS2_thread(void *arg) {
                   usleep(1000);
          }   // End   while (svc_req_L2 == ON)
       }  // End for line = 0 ---> MAX_LINES          // End of scanning one line, next please...
-      usleep(500);                                   // ...give  L3 some time.
+      {
+         uint64_t const t0 = sp_tsc();
+         if (ScanSpin) sp_pace(500);                // bounded spin, no timer
+#if defined(__GENODE__)
+         /* The Timer session at microsecond resolution: 577 us measured for
+            a requested 500, against libc's 1.1 ms and native Linux's 565.
+            libc's nanosleep divides tv_nsec by 1000000 and clamps to 1 ms,
+            which is where the resolution went. */
+         else          genode_pace_us(500);
+#else
+         else          usleep(500);                 // ...give  L3 some time.
+#endif
+         {
+            uint64_t const t1 = sp_tsc();
+            sp_sleep += t1 - t0;
+            if (sp_last) sp_body += t0 - sp_last;
+            sp_last = t1;
+            tw_count[0]++;
+            if (++sp_cycles >= 500) {
+               if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08)) {
+                  static uint64_t tw_last = 0;
+                  uint64_t const nowt = sp_tsc();
+                  if (tw_last) {
+                     double const secs = (double)(nowt - tw_last) / (1980.0*1000000.0);
+                     printf("\rTWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f\n",
+                            tw_count[0]/secs, tw_count[1]/secs, tw_count[2]/secs,
+                            tw_count[3]/secs, tw_count[4]/secs, tw_count[5]/secs,
+                            tw_count[6]/secs);
+                  }
+                  tw_last = nowt;
+                  for (int z = 0; z < 8; z++) tw_count[z] = 0;
+               }
+               if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
+                  printf("\rSCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
+                         (unsigned long long)sp_cycles,
+                         (unsigned long long)(sp_sleep / sp_cycles),
+                         (unsigned long long)(sp_body  / sp_cycles),
+                         (unsigned long long)(100 * sp_sleep / (sp_sleep + sp_body + 1)));
+               sp_cycles = sp_sleep = sp_body = 0;
+            }
+         }
+      }
    }  // End of while(1)...
    return (0);
 }
