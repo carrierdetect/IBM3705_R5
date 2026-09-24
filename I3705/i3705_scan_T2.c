@@ -100,6 +100,7 @@
    See IBM 3705 hardware documentation for more details.
 */
 
+#include <pthread.h>
 #include "sim_defs.h"
 #include "i3705_defs.h"
 #if defined(__GENODE__)
@@ -123,6 +124,18 @@
 #include <time.h>
 #include <unistd.h>
 extern int16 ScanSpin;          /* deposit SCANSPIN 1 in the .cnf */
+extern int16 ScanUs;            /* deposit SCANUS <us> in the .cnf   */
+extern int16 L2Spin;            /* deposit L2SPIN 0 to restore sleeps */
+/* PCF state occupancy, per scanner cycle, per line. Which state a line
+   SITS in is the question a turnaround stall asks, and a full PCF trace
+   is far too loud to answer it during a load. */
+extern volatile unsigned long timer_ticks;   /* should be 10/s: the 3705's 100 ms timer */
+volatile unsigned long pcf_hist[2][16];
+/* Dwell: how long ONE stay in a state lasts, not how many cycles sit in it.
+   A line parked for 1.5 s and a line flicking through the same state a
+   thousand times look identical in the occupancy histogram above. */
+volatile unsigned long long pcf_tsc[2][16];
+volatile unsigned long      pcf_ent[2][16];
 extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
 
 /* TWCOUNT: how many TIMED WAITS each thread performs per second. Inspection
@@ -205,6 +218,94 @@ static void sp_sleep_curve(void) {
    }
 }
 
+/*
+ * WAIT FOR THE CCU TO TAKE THE LEVEL 2, WITHOUT A SYSCALL.
+ *
+ * The two loops below sit on the PER-CHARACTER path: the scanner hands the
+ * CPU one character, raises L2, and cannot go on until the CPU has taken it.
+ * Upstream spins there with usleep(10) in PCF 7 and usleep(1000) otherwise.
+ *
+ * On Genode both of those are libc nanosleep, which divides tv_nsec by
+ * 1000000 and clamps to 1 ms -- MEASURED at 1.7-1.9 ms a call here, against
+ * 65 us and 1.06 ms natively. That is a 28x penalty on usleep(10), paid once
+ * per character, and an NCP load frame is 548 of them: 548 x 1.8 ms = 0.99 s
+ * of pure sleep in a leg that natively costs 0.63 s in total.
+ *
+ * The Timer session does not fix this one. It is right for the scanner's
+ * pace and the CPU's WAIT, which are hundreds of microseconds, but a 10 us
+ * wait cannot afford a round trip -- an earlier attempt to route this loop
+ * through genode_pace_us(10) made it ~50 round trips per character and was
+ * reverted, which is why this looked like "the floor is not the bottleneck".
+ *
+ * So spin on the TSC and do not sleep at all below the cap, then fall back to
+ * the original sleep so a wait that is genuinely long still yields the CPU.
+ * svc_req_L2 is read through a volatile cast: it is a plain int8 written by
+ * another thread, and unlike usleep() a spin gives the compiler nothing to
+ * stop it hoisting the load out of the loop.
+ *
+ * A PURE SPIN HERE IS WORSE THAN THE SLEEP IT REPLACES. Measured: the
+ * remote load went from 404 s to 577 s. The thread this loop waits for is
+ * the emulated CPU, and on a two-core machine also carrying Hercules, the
+ * other 3705 and the relay, busy-waiting for it starves the very thread that
+ * would end the wait. usleep()'s 1.8 ms was buying something real -- it
+ * yielded.
+ *
+ * So yield instead of burning. The floor to aim at is the CPU's own wake
+ * latency (~0.5 ms through its Timer session), not zero: below that there is
+ * nothing to win, because the CPU cannot answer sooner.
+ *
+ * DEPOSIT L2SPIN 0 IN THE .cnf to get the original sleeps back.
+ */
+/*
+ * WAIT FOR THE CCU TO TAKE THE LEVEL 2 -- ON A CONDITION VARIABLE.
+ *
+ * This loop is on the PER-CHARACTER path: the scanner hands the CPU one
+ * character, raises L2, and cannot proceed until the CPU has taken it.
+ * Upstream polls with usleep(10) in PCF 7 and usleep(1000) otherwise. On
+ * Genode libc floors BOTH at about 1.8 ms (measured; natively 65 us and
+ * 1.06 ms), and a frame is 548 characters.
+ *
+ * TWO BUSY-WAIT VERSIONS WERE TRIED AND BOTH WERE WORSE. Measured on the
+ * remote NCP load, against 404 s for the usleep original:
+ *
+ *     bounded TSC spin      577 s   (+43%)
+ *     sched_yield() loop    load never completed; the serial log went
+ *                           silent for 34 minutes
+ *
+ * The reason is the same in both cases: the thread this loop waits for is
+ * the emulated CPU, and on two cores also carrying Hercules, the second
+ * 3705 and the relay, refusing to sleep starves the very thread that would
+ * end the wait. usleep()'s 1.8 ms was buying something real.
+ *
+ * So do not poll at all. The CPU clears svc_req_L2 in one place
+ * (i3705_cpu.c, "Reset L2 request flag") and signals here; this side blocks
+ * until it does. The condition variable's own timeout granularity does not
+ * matter, because the wake comes from the SIGNAL, not from the timeout --
+ * which is exactly what neither sleeping nor spinning could give. The
+ * timeout is only a safety net so a lost signal cannot wedge the scanner.
+ *
+ * DEPOSIT L2SPIN 0 IN THE .cnf to get the original usleep polling back.
+ */
+pthread_mutex_t l2_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  l2_cond = PTHREAD_COND_INITIALIZER;
+
+static void sp_l2_wait(unsigned fallback_us)
+{
+   extern int8 svc_req_L2;
+
+   if (!L2Spin) { usleep(fallback_us); return; }
+
+   pthread_mutex_lock(&l2_lock);
+   if (svc_req_L2 == ON) {
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += 5000000L;                 /* 5 ms safety net */
+      if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+      pthread_cond_timedwait(&l2_cond, &l2_lock, &ts);
+   }
+   pthread_mutex_unlock(&l2_lock);
+}
+
 static void sp_pace(unsigned us) {
    if (!sp_tsc_per_us) sp_calibrate();
    {
@@ -219,6 +320,7 @@ static void sp_pace(unsigned us) {
 #include <sys/time.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -411,6 +513,21 @@ void *CS2_thread(void *arg) {
             pthread_mutex_unlock(&icw_lock);
          }
 
+
+         if (line < 2) {
+            unsigned const st = icw_pcf[line] & 0xF;
+            static unsigned long long ent_t0[2];
+            static unsigned          ent_st[2] = { 16, 16 };
+            unsigned long long const nowp = sp_tsc();
+            pcf_hist[line][st]++;
+            if (ent_st[line] != st) {
+               if (ent_st[line] < 16 && ent_t0[line]) {
+                  pcf_tsc[line][ent_st[line]] += nowp - ent_t0[line];
+                  pcf_ent[line][ent_st[line]]++;
+               }
+               ent_st[line] = st; ent_t0[line] = nowp;
+            }
+         }
 
          switch (icw_pcf[line]) {
             case 0x0:                                // NO-OP
@@ -930,7 +1047,7 @@ void *CS2_thread(void *arg) {
 
             while (svc_req_L2 == ON) {               // Wait till CCU has finished L2 processing
                   l2wait[0]++;
-                  usleep(10);                        // wait until L2 is done.
+                  sp_l2_wait(10);                    // wait until L2 is done.
             }
 
             abar_int = line + 0x020;                 // Set ABAR with line # that caused the L2 int.
@@ -960,24 +1077,39 @@ void *CS2_thread(void *arg) {
          while (svc_req_L2 == ON) {                  // Wait till CCU has finished L2 processing
               if (icw_pcf[line] == 0x7) {              // If we are receiving
                   l2wait[1]++;
-                  usleep(10);                        // wait until L2 is done.
+                  sp_l2_wait(10);                    // wait until L2 is done.
                } else {                                  // If not receiving, wait a bit longer t give L3 a change
                   l2wait[2]++;
-                  usleep(1000);
+                  sp_l2_wait(1000);
                }
          }   // End   while (svc_req_L2 == ON)
       }  // End for line = 0 ---> MAX_LINES          // End of scanning one line, next please...
       {
          uint64_t const t0 = sp_tsc();
-         if (ScanSpin) sp_pace(500);                // bounded spin, no timer
+         /*
+          * SCANUS IS THE LINE'S CHARACTER CLOCK, and 500 us was chosen for
+          * the CPU it costs rather than for the rate it produces. One cycle
+          * of this loop moves ONE character on each line, so the cycle rate
+          * IS the line rate: at the 1225 cycles/s this settles to, a 542
+          * byte frame takes 442 ms to clock out, and a block plus its reply
+          * is most of a second before anything is processed. A real 56 kbps
+          * line carries about 7000 characters/s.
+          *
+          * Measured on the two-3705 trunk remote load: 133 data blocks each
+          * way, 268 turnarounds of over a second, ~91% of the elapsed time,
+          * and that count did not move for ANY of the CPU-side fixes --
+          * neither the idle throttle nor the WAIT state latency -- because
+          * the line is character-clocked here and nowhere else.
+          */
+         if (ScanSpin) sp_pace(ScanUs ? ScanUs : 500);  // bounded spin, no timer
 #if defined(__GENODE__)
          /* The Timer session at microsecond resolution: 577 us measured for
             a requested 500, against libc's 1.1 ms and native Linux's 565.
             libc's nanosleep divides tv_nsec by 1000000 and clamps to 1 ms,
             which is where the resolution went. */
-         else          genode_pace_us(500);
+         else          genode_pace_us(ScanUs ? ScanUs : 500);
 #else
-         else          usleep(500);                 // ...give  L3 some time.
+         else          usleep(ScanUs ? ScanUs : 500);  // ...give  L3 some time.
 #endif
          {
             uint64_t const t1 = sp_tsc();
@@ -998,10 +1130,31 @@ void *CS2_thread(void *arg) {
                             l2wait[0]/secs, l2wait[1]/secs, l2wait[2]/secs,
                             lvl_hist[0]/secs, lvl_hist[1]/secs, lvl_hist[2]/secs,
                             lvl_hist[3]/secs, lvl_hist[4]/secs, lvl_hist[5]/secs);
+                  printf("\rTICKS: %.1f/s (100ms timer, want 10.0)\n", timer_ticks/secs);
+                  timer_ticks = 0;
                   printf("\rL3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
                          l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
                          l3_why[3]/secs, l3_why[4]/secs);
                   for (int z = 0; z < 5; z++) l3_why[z] = 0;
+                  }
+                  for (int ln = 0; ln < 2; ln++) {
+                     unsigned long tot = 0;
+                     for (int q = 0; q < 16; q++) tot += pcf_hist[ln][q];
+                     if (!tot) continue;
+                     printf("\rPCF%d:", ln);
+                     for (int q = 0; q < 16; q++)
+                        if (pcf_hist[ln][q])
+                           printf(" %X=%.0f%%", q, 100.0*pcf_hist[ln][q]/tot);
+                     printf("  (%lu cycles)\n", tot);
+                     printf("\rDWELL%d:", ln);
+                     for (int q = 0; q < 16; q++)
+                        if (pcf_ent[ln][q])
+                           printf(" %X=%.0fus/%lu", q,
+                                  pcf_tsc[ln][q]/(double)pcf_ent[ln][q]/2100.0,
+                                  pcf_ent[ln][q]);
+                     printf("\n");
+                     for (int q = 0; q < 16; q++) { pcf_tsc[ln][q]=0; pcf_ent[ln][q]=0; }
+                     for (int q = 0; q < 16; q++) pcf_hist[ln][q] = 0;
                   }
                   printf("\rLVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
                          lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/2100.0 : 0.0,

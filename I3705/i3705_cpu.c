@@ -155,8 +155,10 @@
 extern volatile unsigned long tw_count[8];
 #if defined(__GENODE__)
 extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+extern void genode_cpu_pace_us(unsigned us); /* ...this thread's own connection */
 #else
 #define genode_pace_us(us) usleep(us)
+#define genode_cpu_pace_us(us) usleep(us)
 #endif
 
 /* IDLE LOADER THROTTLE.  A 3705 that has not been loaded is NOT idle:
@@ -172,9 +174,27 @@ extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
    gated on a run of iterations with NO interrupt requested at any level:
    an arriving load raises L1/L3 constantly and resets the count, and only
    a loader with nothing to receive ever reaches the limit. */
-#define I3705_IDLE_SPIN_LIMIT  20000u
+/* THE THRESHOLD IS A DURATION, NOT A SPIN COUNT, and that is the whole
+   correction. I3705_IDLE_SPIN_LIMIT was 20000 iterations, which at the
+   measured 8.96M iterations/s is 2.2 MILLISECONDS. The comment above says
+   this must not throttle a loader while the load is arriving -- and 2.2 ms
+   between characters is completely ordinary DURING a load, so it did
+   exactly that. busy below sees the scanner's L2 and the channel's request
+   flags; neither is set while the loader digests a block it has just
+   received, so the rest re-engaged and the block was processed at one
+   instruction per 200 us, 5000/s against 8.96M/s.
+
+   Cost, measured on the two-3705 trunk: 268 turnarounds of over a second in
+   a load of 818 frames -- a third of them, and ~91% of the elapsed time.
+
+   Two seconds of genuine silence still means "nobody is loading this
+   machine", which is what the throttle is for. The frequency below only has
+   to be the right order of magnitude: getting it wrong changes how long an
+   abandoned 3705 waits before it stops burning a core, and nothing else. */
+#define I3705_TSC_PER_SEC      1980000000ULL   /* genherc's i3-8145U */
+#define I3705_IDLE_REST_AFTER  (2ULL * I3705_TSC_PER_SEC)
 #define I3705_IDLE_REST_US     200u
-static unsigned long idle_spins = 0;
+static unsigned long long idle_since = 0;      /* rdtsc when busy last went false */
 /* Which program level the CPU is actually executing, counted per pass.
    debug_reg 0x02 prints on every level ENTRY, which at ~600 entries/s
    over a serial console halts the machine it is meant to observe. This
@@ -258,6 +278,7 @@ int8  last_lu;
 
 int8  cycle_eight = 0;                                  /* Eight cycle counter */
 int8  load_state = OFF;                                 /* Load state flag (IPL loadTest mode flag */
+int8  ncp_running = OFF;                                /* Loaded code has taken over (see IDLEREST) */
 int8  test_mode  = ON;                                  /* Test mode flag */
 int8  bypass_CCU_check = OFF;                           /* CCU check bypass */
 int8  FET_stor_diag = OFF;                              /* FET storage diagnostics */
@@ -274,7 +295,71 @@ int8  IO_par_chk = OFF;                                 /* I/O bus parity check 
 int8  rpl        = OFF;                                 /* Remote Program Loader        */
 int8  CAdisable  = FALSE;                               /* Disable all CA's             */
 int16 ScanSpin   = 0;                                   /* Scanner paces by spin, not sleep */
+/*
+ * UPSTREAM'S VALUE, AND IT STAYS THERE.
+ *
+ * Isolated against the L2 condvar fix, remote NCP load, VARY->IST270I:
+ *
+ *     WAITUS 100, SCANUS 100    174 s
+ *     WAITUS 100, SCANUS 500    203 s   <- this, and it beats native 256 s
+ *     WAITUS 1000, SCANUS 500   never completes
+ *
+ * So SCANUS 100 is worth a real 14%, but it is an OPTION and not part of
+ * the fix: the port is already faster than native without it, and every
+ * microsecond off this pace is more scanner wakeups on a machine that has
+ * two cores for four busy threads. Deposit SCANUS 100 if you want the
+ * 14%; the default keeps the port one knob closer to upstream.
+ *
+ * Contrast WAITUS below, which looks like the same kind of knob and is
+ * not: without it the load does not finish at all.
+ */
+int16 ScanUs     = 500;                                 /* Scanner cycle pace, microseconds */
+/*
+ * BLOCK ON THE L2 HANDSHAKE INSTEAD OF POLLING IT. See sp_l2_wait() in
+ * i3705_scan_T2.c for the mechanism and for what spinning costs.
+ *
+ * ON BY DEFAULT ON GENODE, where libc floors the poll at 1.8 ms and the
+ * remote NCP load goes 404 s -> 174 s.
+ *
+ * OFF BY DEFAULT ON NATIVE, and NOT because it does not help there: the
+ * same load measured 255 s polling and 213 s on the condvar, about 16%.
+ * It is off because THIS BINARY IS THE REFERENCE the Genode port is
+ * measured against, and a reference that has been improved is no longer
+ * upstream's behaviour. Deposit L2SPIN 1 to get the 16% on Linux; see
+ * upstream/ibm3705/18-l2-handshake-polls-per-character.md.
+ */
+#if defined(__GENODE__)
+int16 L2Spin     = 1;                                   /* block on the L2 handshake */
+#else
+int16 L2Spin     = 0;                                   /* native: upstream polling, as shipped */
+#endif
 int16 IdleRest   = 1;                                   /* Rest the loader when nothing arrives */
+#if defined(__GENODE__)
+/*
+ * 100 us ON GENODE, AND IT IS NOT OPTIONAL -- IT IS PART OF THE L2
+ * CONDITION-VARIABLE FIX, NOT TUNING ALONGSIDE IT.
+ *
+ * Tested: with this back at upstream's 1000, the remote NCP load DOES NOT
+ * COMPLETE AT ALL -- 42 minutes after the VARY with the rc script's
+ * retries exhausted and MVS sitting idle. With it at 100 the same load
+ * takes 174 s.
+ *
+ * Why they are coupled: the scanner now BLOCKS on a condvar waiting for
+ * the CPU to take the L2 (see sp_l2_wait() in i3705_scan_T2.c). How long
+ * that block lasts is set by how quickly the CPU wakes to take it. At
+ * WAITUS 1000 the CPU wakes about every 1.8 ms, so the scanner falls
+ * through to the condvar's 5 ms safety timeout instead of being signalled
+ * -- which is WORSE than the usleep(10) poll the condvar replaced.
+ *
+ * Measured earlier, BEFORE the condvar, this knob changed nothing: it
+ * tripled the CPU's wake rate and moved the load time not at all, because
+ * the usleep floor on the L2 handshake dominated everything. That is why
+ * it looked like unjustified tuning. It is not; it is half of one fix.
+ */
+int16 WaitUs     = 100;                                 /* WAIT state poll, microseconds */
+#else
+int16 WaitUs     = 1000;                                /* upstream, unchanged */
+#endif
 extern int16 LibSigMs;                                  /* ReadSig poll period, ms (i3705_lib.c) */
 extern int16 LinePollMs;                                /* Line receive poll timeout, ms         */
 int8  load_prsd  = FALSE;                               /* Load button pressed          */
@@ -455,7 +540,10 @@ REG cpu_reg[] = {
     { HRDATA (RPL, rpl, 8) },
     { HRDATA (CADISABLE, CAdisable, 16) },
     { HRDATA (SCANSPIN, ScanSpin, 16) },
+    { HRDATA (SCANUS,   ScanUs, 16) },
+    { HRDATA (L2SPIN,   L2Spin, 16) },
     { HRDATA (IDLEREST, IdleRest, 16) },
+    { HRDATA (WAITUS,   WaitUs, 16) },
     { HRDATA (LIBSIG,   LibSigMs, 16) },
     { HRDATA (LINEPOLL, LinePollMs, 16) },
     { HRDATA (WRU, sim_int_char, 8) },
@@ -774,13 +862,30 @@ while (reason == 0) {                          /* Loop until halted */
    if (lvl >= 0 && lvl <= 5) lvl_hist[wait_state == ON ? 0 : lvl]++;
 
    if (wait_state == ON) {
-      tw_count[2]++; usleep(1000);                            // Get some rest...
-      /* NO idle_spins RESET HERE. Entering wait state means the CPU had
-         nothing to run, which is MORE idle, not less. Resetting made the
-         throttle unreachable on any machine that waits periodically: a
-         remote 3705 enters wait ~41 times a second and makes ~1260 passes
-         a second, so it never accumulated the 20000 consecutive spins the
-         limit asks for, and the throttle never once fired on it. */
+      /*
+       * usleep(1000) HERE WAS A FULL MILLISECOND, and the CPU cannot notice
+       * the interrupt it is waiting for until it returns. libc's nanosleep
+       * divides tv_nsec by 1000000, so anything under a millisecond becomes
+       * one -- the same API artefact that was fixed for the scanner, and the
+       * reason that fix took the scanner to 99% of native. The emulated CPU
+       * never got it.
+       *
+       * Measured during a remote load: about 2100 passes/s on the local 3705
+       * and 1060/s on the remote, against 8.96M/s when it is not waiting, and
+       * the remote sat in WAIT for most of every stall.
+       *
+       * DEPOSIT WAITUS 1000 IN THE .cnf to get the old millisecond back.
+       * Its own Timer connection, not the scanner's: usleep() on one blocks
+       * on that connection's blockade and two threads must not share it.
+       */
+      tw_count[2]++; genode_cpu_pace_us(WaitUs ? WaitUs : 1);   // Get some rest...
+      /* NO idle_since RESET HERE. Entering wait state means the CPU had
+         nothing to run, which is MORE idle, not less -- and the clock the
+         gate reads must keep running across a wait or a machine that waits
+         periodically never accumulates any idle time at all. That is what
+         went wrong when this reset the old spin counter: a remote 3705
+         enters wait ~41 times a second, so the count never reached 20000
+         consecutive spins and the throttle never once fired on it. */
       continue;
    }
 
@@ -802,7 +907,32 @@ while (reason == 0) {                          /* Loop until halted */
     * off through busy below, so this only rests a machine with nothing
     * to do.
     */
-   if (IdleRest && (load_state == ON || CAdisable)) {
+   /*
+    * ncp_running IS THE POINT OF THIS TEST, not a refinement of it.
+    *
+    * load_state means "the diskette loader is running": set in IPL phase 2
+    * and cleared by the LOADED code through Ereg 0x77 bit 0x0040. On a local
+    * 3705 that is a complete answer -- it goes OFF the moment the NCP takes
+    * over and the throttle stops.
+    *
+    * A REMOTE 3705 NEVER SETS IT. cpu_reset leaves every ABswitch at -1 under
+    * CAdisable, the miniROS branch is skipped, cpu_boot() is never reached --
+    * which is why "|| CAdisable" is here at all. But CAdisable is a property
+    * of the MACHINE, not of a phase, so on its own it armed this throttle for
+    * the WHOLE LIFE of a remote 3705, the loaded NCP included.
+    *
+    * That cost 1.3 s per data block. busy below sees the scanner's characters
+    * and the channel's requests; it does NOT see the NCP executing, because
+    * between frames there are no characters and a remote has no channel. So
+    * once a frame was in, 20000 spins later the rest re-engaged and the NCP
+    * processed the block at one instruction per 200 us -- 5000/s against
+    * 8.96M/s. Measured: 268 turnarounds over a second, a third of the frames
+    * and ~91% of the remote load's elapsed time.
+    *
+    * So latch the same Ereg write that clears load_state, and use it whether
+    * or not load_state was ever ON.
+    */
+   if (IdleRest && !ncp_running && (load_state == ON || CAdisable)) {
       /* LEVEL 1 IS DELIBERATELY EXCLUDED.  ipl_req_L1 is ON from reset
          until the LOADED code clears it via Ereg 0x77 (see below), and
          line 624 turns that into int_lvl_req[1] = ON on every pass -- so
@@ -853,14 +983,18 @@ while (reason == 0) {                          /* Loop until halted */
                  (int_lvl_req[2] == ON) ||
                  CA1_IS_req_L3 || CA1_DS_req_L3 || pci_req_L3;
       if (busy) {
-         idle_spins = 0;
-      } else if (IdleRest == 2 || ++idle_spins >= I3705_IDLE_SPIN_LIMIT) {
-         idle_spins = I3705_IDLE_SPIN_LIMIT;
-         tw_count[7]++;
-         genode_pace_us(I3705_IDLE_REST_US);
+         idle_since = 0;
+      } else {
+         unsigned long long const now_i = __builtin_ia32_rdtsc();
+         if (idle_since == 0) {
+            idle_since = now_i;
+         } else if (IdleRest == 2 || now_i - idle_since >= I3705_IDLE_REST_AFTER) {
+            tw_count[7]++;
+            genode_cpu_pace_us(I3705_IDLE_REST_US);
+         }
       }
    } else {
-      idle_spins = 0;
+      idle_since = 0;
    }
 
 //=======================================================================================
@@ -2159,6 +2293,15 @@ while (reason == 0) {                          /* Loop until halted */
                // An Input x'40' will reset L2 req
                svc_req_L2 = OFF;               /* Reset L2 request flag */
                pthread_mutex_unlock(&r77_lock);
+               /* Wake the scanner NOW. It blocks here rather than polling:
+                  see sp_l2_wait() in i3705_scan_T2.c, which records what
+                  sleeping and spinning each cost on this path. */
+               {  extern pthread_mutex_t l2_lock;
+                  extern pthread_cond_t  l2_cond;
+                  pthread_mutex_lock(&l2_lock);
+                  pthread_cond_signal(&l2_cond);
+                  pthread_mutex_unlock(&l2_lock);
+               }
             } else {
                // Read ABAR when executing in L3 or L4.
                Eregs_Inp[0x40] = 0x0800 + (abar << 1);  /* Echo abar */
@@ -2499,8 +2642,10 @@ while (reason == 0) {                          /* Loop until halted */
                   else
                      CL_Z[3] = OFF;
                }
-               if (Eregs_Out[Efld] & 0x0040)   // Reset load state
+               if (Eregs_Out[Efld] & 0x0040) { // Reset load state
                   load_state = OFF;
+                  ncp_running = ON;           // ...and it is the NCP running now, not the loader.
+               }
                if (Eregs_Out[Efld] & 0x0020)   // Set test mode
                   test_mode = ON;
                if (Eregs_Out[Efld] & 0x0002)   // Set test mode
@@ -3503,6 +3648,7 @@ t_stat cpu_reset (DEVICE *dptr) {              /* RESET pressed */
    test_mode  = ON;                            /* See PoO 5-11 */
    pgm_stop   = OFF;
    load_state = OFF;
+   ncp_running = OFF;
    wait_state = OFF;
    OP_reg_chk = OFF;
    IO_L5_chk  = OFF;

@@ -33,6 +33,7 @@
 #include <string.h>
 
 extern volatile unsigned long tw_count[8];   /* pnl= in the telemetry */
+volatile unsigned long timer_ticks = 0;      /* 100 ms interval timer, actual */
 #include <unistd.h>
 #include <pthread.h>
 #include <ifaddrs.h>
@@ -288,6 +289,7 @@ void timer_msec (long int msec) {
 // Kick the 3705 100msec timer...
 void sig_handler (int signo) {
    float millis = 0.0;
+   timer_ticks++;          /* count the TICK, not the servicing of it */
    /*
     * "&" HERE, NOT "&=".  This is the 100 ms interval timer's handler and the
     * test is meant to read "if the timer request bit is not already set".
@@ -301,8 +303,6 @@ void sig_handler (int signo) {
     * not a deliberate clear is plain from i3705_cpu.c, which rebuilds this
     * register with "Eregs_Inp[0x7F] &= 0x0204;" and takes care to PRESERVE
     * the panel and timer bits while it does so.
-    *
-    * Correctness only: measured, it does not change the remote load time.
     */
    if ((test_mode == OFF) && !(Eregs_Inp[0x7F] & 0x0004)) {
       pthread_mutex_lock(&r7f_lock);
