@@ -43,7 +43,17 @@
 #include "i327x_327x.h"
 #include "ebcdic.h"
 #include <errno.h>
+#if defined(__GENODE__)
+/* Same substitutions as the 3274's, and for the same reasons -- see
+   0007-i3274-genode-ipc.patch. This is the BSC cluster where that is the
+   SDLC controller; the seams are identical. */
+#include <poll.h>
+#include <errno.h>
+#include "genode_line.h"
+#include "genode_xlink.h"
+#else
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -68,7 +78,9 @@ FILE *T_trace;
 
 struct sockaddr_in servaddr;
 struct sockaddr_in    sin1, *sin2; /* bind socket address structure     */
+#if !defined(__GENODE__)
 struct epoll_event event, events[MAXCLSTR*2];
+#endif
 struct ifaddrs *nwaddr, *ifa;      /* interface address structure       */
 in_addr_t  lineip;                 /* BSC line listening address        */
 uint16_t   lineport;               /* BSC line listening port           */
@@ -438,6 +450,12 @@ int proc_CLUiml() {
       clu[j]->punum = j;
    }  // End for j = 0
 
+#if defined(__GENODE__)
+   /* One interface, no getifaddrs in lwIP, and which address the listener is
+      reachable at is decided by the run script's tcp-forward. */
+   ipaddr = NULL;
+   printf("\rCLU: listening on every address this component has, for 3270 connections\n");
+#else
    getifaddrs(&nwaddr);      /* get network address */
    for (ifa = nwaddr; ifa != NULL; ifa = ifa->ifa_next) {
       if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, "lo")) {
@@ -447,6 +465,7 @@ int proc_CLUiml() {
       }
    }
    printf("\rCLU: Using network Address %s on %s for 3270 connections\n", ipaddr, ifa->ifa_name);
+#endif
 
    for (BYTE j = 0; j < MAXCLSTR; j++) {
       if ((clu[j]->pu_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1)
@@ -457,7 +476,11 @@ int proc_CLUiml() {
       setsockopt(clu[j]->pu_fd, SOL_SOCKET, SO_REUSEADDR, (void*)&sockopt, sizeof(sockopt));
       /* Bind the socket */
       sin1.sin_family=AF_INET;
+#if defined(__GENODE__)
+      sin1.sin_addr.s_addr = htonl(INADDR_ANY);
+#else
       sin1.sin_addr.s_addr = inet_addr(ipaddr);
+#endif
       sin1.sin_port=htons(32711+j);
       if (bind(clu[j]->pu_fd, (struct sockaddr *)&sin1, sizeof(sin1)) < 0) {
           printf("\rCLU: Bind 3271-%01X socket failed\n\r", j);
@@ -471,6 +494,7 @@ int proc_CLUiml() {
           return -1;
       }
       // Add polling events for the port
+#if !defined(__GENODE__)
       clu[j]->epoll_fd = epoll_create(1);
       if (clu[j]->epoll_fd == -1) {
          printf("\rCLU: failed to created the 3271-%01X epoll file descriptor\n\r", j);
@@ -485,6 +509,7 @@ int proc_CLUiml() {
          free(clu[j]);
          return -4;
       }
+#endif
       printf("\rCLU: 3271-%01X IML ready. TN3270 can connect to port %d \n\r)", j,32711+j);
    }  // End for j=0
    return 0;
@@ -501,7 +526,15 @@ int proc_3270 () {
    // Next, check all active connection for input data.
    //
    for (BYTE k = 0; k < MAXCLSTR; k++) {
+#if defined(__GENODE__)
+      {
+         struct pollfd pfd;
+         pfd.fd = clu[k]->pu_fd; pfd.events = POLLIN; pfd.revents = 0;
+         event_count = (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) ? 1 : 0;
+      }
+#else
       event_count = epoll_wait(clu[k]->epoll_fd, events, MAXLU, 50);
+#endif
       for (int i = 0; i < event_count; i++) {
          if (clu[k]->lunum != 0xFF) {                                            /* if avail LU pool not exhausted      */
             clu[k]->lu_fd[clu[k]->lunum]=accept(clu[k]->pu_fd, NULL, 0);
@@ -546,8 +579,34 @@ int proc_3270 () {
       }  // End for int i
       for (BYTE j = 0; j < MAXLU; j++) {
          if (clu[k]->lu_fd[j] > 0) {
+#if defined(__GENODE__)
+            /* No ioctl on this plugin, so poll -- and poll ONLY. Peeking
+               to tell "no data" from "peer gone" does not work here: this
+               lwIP returns 0 from recv(MSG_PEEK) on a live idle socket, and
+               0 from read() on it too, which is what a closed peer returns.
+               The 3274 carried the same peek and dropped every terminal 16 ms
+               after accepting it; see 0007's preamble for the measurements.
+               A quiet read is quiet, and a close comes from POLLHUP/POLLERR
+               and from the write path. */
+            {
+               struct pollfd pfd;
+
+               pfd.fd = clu[k]->lu_fd[j]; pfd.events = POLLIN; pfd.revents = 0;
+               rc = 0; pendingrcv = 0;
+               if (poll(&pfd, 1, 0) > 0) {
+                  if (pfd.revents & (POLLERR | POLLNVAL))      rc = -1;
+                  else if (pfd.revents & POLLIN)               pendingrcv = 1;
+                  else if (pfd.revents & POLLHUP)              rc = -1;
+               }
+            }
+#else
             rc = ioctl(clu[k]->lu_fd[j], FIONREAD, &pendingrcv);
+            /* Outside the #else this ran on Genode too and undid the poll
+               above: SocketReadAct is a select() for readability, which a
+               quiet socket fails, so every idle terminal was disconnected
+               regardless of what poll had just decided. */
             if ((pendingrcv < 1) && (SocketReadAct(clu[k]->lu_fd[j]))) rc = -1;
+#endif
             if (rc < 0) {
                clu[k]->not_ready[j] = 1;
                free(ioblk[k][j]);
@@ -560,6 +619,9 @@ int proc_3270 () {
             } else {
                if (pendingrcv > 0) {
                   rc=read(clu[k]->lu_fd[j], bfr, 256-BUFPD);
+#if defined(__GENODE__)
+                  if (rc <= 0) continue;   /* readable but empty: see above */
+#endif
                   //******
                   if (Tdbg_flag == ON) {
                      fprintf(T_trace, "%s 3270 Read Buffer: ",TimeStamp());
@@ -648,11 +710,29 @@ void main(int argc, char *argv[]) {
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       T_trace = fopen("trace_3271.log", "w");
+#if defined(__GENODE__)
+      /* /dev/log, not /dev/null: a component with nowhere to put a file
+         still has somewhere to put a line. See the 3274's patch. */
+      if (T_trace == NULL) {
+         T_trace = fopen("/dev/log", "w");
+         if (T_trace != NULL) setvbuf(T_trace, NULL, _IONBF, 0);
+      }
+#endif
       fprintf(T_trace, "     ****** 3271 Terminal Controller log file ****** \n"
                        "     ******          Date: %02d/%02d/%04d         ****** \n\n"
                        "     i327x_3271 -d : trace all 3271 activities\n",
                        currentTime->tm_mday, currentTime->tm_mon + 1, currentTime->tm_year + 1900);
    }
+#if defined(__GENODE__)
+   /* No socket, no connect and no retry loop: the line is a crosslink that
+      was open before either program started. genode_line.h has the rest. */
+   linenum = (int) genode_line_number();
+   if (genode_line_open() != 0)
+      return;
+   clubsc_fd = genode_line_fd();
+   printf("\rCLU: BSC line %d is a crosslink; no connection to establish\n",
+          linenum);
+#else
    // BSC line socket creation
    clubsc_fd = socket(AF_INET, SOCK_STREAM, 0);
    if (clubsc_fd <= 0) {
@@ -668,16 +748,30 @@ void main(int argc, char *argv[]) {
    while (connect(clubsc_fd, (struct sockaddr*)&servaddr, sizeof(servaddr)) != 0) {
       sleep(1);
    }
+#endif
    printf("\rCLU: BSC line connection has been established\n");
    // Now 'IML' the 3271
    rc = proc_CLUiml();
    while (1) {
       rc = proc_3270();
+#if defined(__GENODE__)
+      pendingrcv = xlink_avail(clubsc_fd, 10) ? (int) sizeof(BSC_rbuf) : 0;
+      rc = 0;
+#else
       rc = ioctl(clubsc_fd, FIONREAD, &pendingrcv);
+#endif
+#if !defined(__GENODE__)
       if ((pendingrcv < 1) && (SocketReadAct(clubsc_fd))) rc = -1;
       if (rc < 0) {                      // Retry once to account for timing delays in TCP.
          if ((pendingrcv < 1) && (SocketReadAct(clubsc_fd))) rc = -1;
       }
+#else
+      /* A crosslink does not disconnect, and SocketReadAct is a select() on
+         an fd that is not a socket. Letting it run took the "line dropped"
+         path below, which close()s the crosslink and rebuilds it as a TCP
+         socket -- unrecoverable here. Same reasoning as the unreachable
+         disconnect branch in i3705_lib.c's ReadLIB. */
+#endif
       if (rc < 0) {
          printf("\rCLU: BSC line dropped, trying to re-establish connection\n");
          // BSC line socket recreation
@@ -739,7 +833,20 @@ void main(int argc, char *argv[]) {
       //****************************************************************************************************************************
                BSCrlen = proc_BSC(&BSC_tbuf[Fptr], frame_len);      // precess transmission
                if (BSCrlen != 0) {                                  // If response available, send it
+#if defined(__GENODE__)
+                  /* Whole message, and a crosslink is NOT a socket: send()
+                     on a VFS terminal fd fails, rc is never looked at here,
+                     and the trace below prints the buffer regardless -- so a
+                     response that never left the component logged exactly
+                     like one that did. The 3705 then polled an empty line
+                     until REPLYTO expired. The 3274 got this substitution in
+                     0007 and the 3271 did not. See ../xlink/genode_xlink.h. */
+                  rc = xlink_write(clubsc_fd, BSC_rbuf, BSCrlen);
+#else
                   rc = send(clubsc_fd, BSC_rbuf, BSCrlen, 0);
+#endif
+                  if (rc < 0)
+                     printf("\rCLU: BSC line write failed\n");
                   if (Tdbg_flag == ON) {
                      fprintf(T_trace, "%s 3271 Send Buffer: ",TimeStamp());
                      for (int i = 0; i < BSCrlen; i ++) {
