@@ -152,6 +152,45 @@
 */
 
 #include <sched.h>
+extern volatile unsigned long tw_count[8];
+#if defined(__GENODE__)
+extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+#else
+#define genode_pace_us(us) usleep(us)
+#endif
+
+/* IDLE LOADER THROTTLE.  A 3705 that has not been loaded is NOT idle:
+   cpu_boot() puts a miniROS in storage and starts it at level 1, and that
+   loader POLLS for a load to arrive.  On real hardware that costs nothing.
+   In emulation it pins a host core for as long as the machine sits waiting,
+   which on the trunk pair is the whole of the remote load -- 3705b spins
+   while 3705a is the one that has to carry the transfer, and 3705a's
+   scanner drops from 1480 cycles/s to 103.
+
+   What this must NOT do is throttle the loader when the load is actually
+   arriving, because on 3705b that loader IS the receiver.  So the rest is
+   gated on a run of iterations with NO interrupt requested at any level:
+   an arriving load raises L1/L3 constantly and resets the count, and only
+   a loader with nothing to receive ever reaches the limit. */
+#define I3705_IDLE_SPIN_LIMIT  20000u
+#define I3705_IDLE_REST_US     200u
+static unsigned long idle_spins = 0;
+/* Which program level the CPU is actually executing, counted per pass.
+   debug_reg 0x02 prints on every level ENTRY, which at ~600 entries/s
+   over a serial console halts the machine it is meant to observe. This
+   is the same question asked cheaply: [0] passes in wait state, [1..5]
+   passes at that level. Reported through TWCOUNT, once every 500
+   scanner cycles. */
+volatile unsigned long lvl_hist[6];
+/* TSC spent per program level, to answer where a CPU-thread pass goes.
+   3705b makes ~1260 passes/s while resting 23 ms/s, i.e. ~0.77 ms inside
+   each pass, which is absurd for an interpreter unless it blocks. */
+volatile unsigned long long lvl_tsc[6];
+/* The five things that raise level 3, counted separately. L3 is the level
+   the CPU spins in after a failed link activation (13M passes/s), and
+   "L3 is asserted" does not say WHICH of these is stuck. Same method that
+   separated L1/L2/L3 and found the channel-thread spinner. */
+volatile unsigned long l3_why[5];   /* inter, timer, pci, CA1_DS, CA1_IS */
 #include "i3705_defs.h"
 #include "i3705_Eregs.h"                                /* Exernal regs defs */
 #include <sys/time.h>
@@ -234,6 +273,8 @@ int8  CS4_L1_chk = OFF;                                 /* Scanner 4 adaptor L1 
 int8  IO_par_chk = OFF;                                 /* I/O bus parity check */
 int8  rpl        = OFF;                                 /* Remote Program Loader        */
 int8  CAdisable  = FALSE;                               /* Disable all CA's             */
+int16 ScanSpin   = 0;                                   /* Scanner paces by spin, not sleep */
+int16 IdleRest   = 1;                                   /* Rest the loader when nothing arrives */
 int8  load_prsd  = FALSE;                               /* Load button pressed          */
 int32 lvl;                                              /* Active Program Level (1...5) */
 int32 Grp;                                              /* Active Register Group (0...3) */
@@ -411,6 +452,8 @@ REG cpu_reg[] = {
     /* Misc */
     { HRDATA (RPL, rpl, 8) },
     { HRDATA (CADISABLE, CAdisable, 16) },
+    { HRDATA (SCANSPIN, ScanSpin, 16) },
+    { HRDATA (IDLEREST, IdleRest, 16) },
     { HRDATA (WRU, sim_int_char, 8) },
     { HRDATA (SHWLIB, shwlib, 8) },
     { HRDATA (DEBUG, debug_reg, 16) },
@@ -602,6 +645,11 @@ while (reason == 0) {                          /* Loop until halted */
    else int_lvl_req[2] = OFF;
 
    /* Check for any L3 requests ? */
+   if (inter_req_L3)   l3_why[0]++;
+   if (timer_req_L3)   l3_why[1]++;
+   if (pci_req_L3)     l3_why[2]++;
+   if (CA1_DS_req_L3)  l3_why[3]++;
+   if (CA1_IS_req_L3)  l3_why[4]++;
    if (inter_req_L3 || timer_req_L3 || pci_req_L3 || CA1_DS_req_L3 || CA1_IS_req_L3)
       int_lvl_req[3] = ON;                     // Set L3 interrupt request
    else int_lvl_req[3] = OFF;
@@ -710,9 +758,105 @@ while (reason == 0) {                          /* Loop until halted */
       break;                                   // Continue with current pgm lvl
    }
 
+   {  /* attribute the elapsed time to the level of the pass just ended */
+      static unsigned long long pass_t0 = 0;
+      static int prev_lvl = 0;
+      unsigned long long const now_t = __builtin_ia32_rdtsc();
+      if (pass_t0 && prev_lvl >= 0 && prev_lvl <= 5)
+         lvl_tsc[prev_lvl] += now_t - pass_t0;
+      pass_t0  = now_t;
+      prev_lvl = (wait_state == ON) ? 0 : ((lvl >= 0 && lvl <= 5) ? lvl : 5);
+   }
+   if (lvl >= 0 && lvl <= 5) lvl_hist[wait_state == ON ? 0 : lvl]++;
+
    if (wait_state == ON) {
-      usleep(1000);                            // Get some rest...
+      tw_count[2]++; usleep(1000);                            // Get some rest...
+      /* NO idle_spins RESET HERE. Entering wait state means the CPU had
+         nothing to run, which is MORE idle, not less. Resetting made the
+         throttle unreachable on any machine that waits periodically: a
+         remote 3705 enters wait ~41 times a second and makes ~1260 passes
+         a second, so it never accumulated the 20000 consecutive spins the
+         limit asks for, and the throttle never once fired on it. */
       continue;
+   }
+
+   /* See I3705_IDLE_SPIN_LIMIT above. */
+   /*
+    * CAdisable IS PART OF THE GATE, and leaving it out meant this
+    * throttle never once fired on the machine that needed it most.
+    *
+    * load_state is set only in cpu_boot(), and a CAdisable 3705 -- the
+    * far end of a trunk -- never reaches it: cpu_reset() sets every AB
+    * switch to -1 and the miniROS branch is skipped, so it boots its
+    * diskette loader instead. Measured, both machines pre-load with no
+    * NCP in either:
+    *
+    *   3705a  scan=860/s  idle=860/s   throttle firing
+    *   3705b  scan= 47/s  idle=  0     throttle never fires
+    *
+    * Same code, same phase, 18x apart. An arriving load still holds it
+    * off through busy below, so this only rests a machine with nothing
+    * to do.
+    */
+   if (IdleRest && (load_state == ON || CAdisable)) {
+      /* LEVEL 1 IS DELIBERATELY EXCLUDED.  ipl_req_L1 is ON from reset
+         until the LOADED code clears it via Ereg 0x77 (see below), and
+         line 624 turns that into int_lvl_req[1] = ON on every pass -- so
+         including level 1 made "busy" true on all 8.96M iterations/s and
+         the throttle never fired once.  Levels 2-5 carry the real work:
+         the scanner raises L2 (CS2_req_L2_int) for every character it has
+         for the CPU, so an arriving load keeps this busy and only a loader
+         with nothing to receive ever reaches the limit. */
+      /* LEVEL 2 ONLY, and the other levels are deliberately excluded.
+         Measured on genherc 2026-09-19, pre-load, 3705b:
+
+             it=9452334  L2=0  L3=9448399  L4=0
+
+         L1 is ipl_req_L1, ON from reset until the LOADED code clears it
+         via Ereg 0x77, so it says "waiting to be loaded", not "busy".
+         L3 is pending on 99.96% of iterations and never serviced -- a
+         masked request the CPU cannot take -- so it says nothing about
+         whether work is arriving either.  L2 is the one that does: the
+         scanner sets CS2_req_L2_int for every character it has for the
+         CPU, and it is EXACTLY ZERO while the loader has nothing to
+         receive.  So an arriving load keeps this busy and a waiting one
+         does not.  Two earlier gates (all levels, then levels 2-5) fired
+         zero times because of L1 and L3 respectively.
+
+         DEPOSIT IDLEREST 0 IN THE .cnf TO TURN ALL OF THIS OFF and get
+         the original flat-out loader back.  The gate reasons about
+         interrupt levels whose meaning is not obvious and was wrong
+         twice before it was right, so a machine that misbehaves in a way
+         that might be this should be able to rule it out in one line of
+         config rather than a rebuild.  Same idiom as SCANSPIN.
+
+         L3 IS SPLIT rather than used whole.  It is
+             inter_req_L3 || timer_req_L3 || pci_req_L3
+                          || CA1_DS_req_L3 || CA1_IS_req_L3
+         and the housekeeping half (panel, interval timer) is what is
+         permanently pending.  The channel half is real work: gating on
+         L2 ALONE throttled 3705a straight through its CHANNEL load,
+         which arrives as CA1_IS/CA1_DS and never raises L2 -- measured
+         as idle=39 while cawait=39, i.e. resting the CPU precisely while
+         the channel waited on the load.  So take the scanner's L2 and
+         the channel's own request flags, and leave the timer and panel
+         out. */
+      /* IDLEREST=2 is a DIAGNOSTIC: rest regardless of busy. If the
+         scanner speeds up under it, the CPU thread starving its own
+         scanner is what makes this component 13x late. Not a fix --
+         it throttles real work too. */
+      int busy = (IdleRest == 2) ? 0 :
+                 (int_lvl_req[2] == ON) ||
+                 CA1_IS_req_L3 || CA1_DS_req_L3 || pci_req_L3;
+      if (busy) {
+         idle_spins = 0;
+      } else if (IdleRest == 2 || ++idle_spins >= I3705_IDLE_SPIN_LIMIT) {
+         idle_spins = I3705_IDLE_SPIN_LIMIT;
+         tw_count[7]++;
+         genode_pace_us(I3705_IDLE_REST_US);
+      }
+   } else {
+      idle_spins = 0;
    }
 
 //=======================================================================================

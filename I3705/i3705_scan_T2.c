@@ -128,8 +128,18 @@ extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
 /* TWCOUNT: how many TIMED WAITS each thread performs per second. Inspection
    has failed three times to say which thread degrades the scanner's sleep;
    this counts them instead. Index: 0 scanner, 1 panel, 2 cpu, 3 CA avail10,
-   4 CA avail100, 5 LIB, 6 CA wait(). */
+   4 CA avail100, 5 LIB, 6 CA wait(), 7 idle-loader rests. */
 volatile unsigned long tw_count[8];
+extern volatile unsigned long lvl_hist[6];
+extern volatile unsigned long long lvl_tsc[6];
+extern volatile unsigned long l3_why[5];
+/* Where the scanner BODY goes. SCANPERF says 3705b spends ~50% of each
+   cycle in the body against 3705a's 1%, and the only blocking things in
+   it are the two svc_req_L2 waits. [0] first loop, [1] second loop while
+   RECEIVING (usleep(10), floored to 1 ms), [2] second loop otherwise
+   (usleep(1000)). Each iteration of [1] or [2] costs about a millisecond,
+   so these are milliseconds per second spent waiting for the CCU. */
+volatile unsigned long l2wait[3];
 static uint64_t sp_sleep, sp_body, sp_cycles, sp_last;
 static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
 
@@ -909,6 +919,7 @@ void *CS2_thread(void *arg) {
             }
 
             while (svc_req_L2 == ON) {               // Wait till CCU has finished L2 processing
+                  l2wait[0]++;
                   usleep(10);                        // wait until L2 is done.
             }
 
@@ -937,10 +948,13 @@ void *CS2_thread(void *arg) {
          }
 
          while (svc_req_L2 == ON) {                  // Wait till CCU has finished L2 processing
-              if (icw_pcf[line] == 0x7)              // If we are receiving
+              if (icw_pcf[line] == 0x7) {              // If we are receiving
+                  l2wait[1]++;
                   usleep(10);                        // wait until L2 is done.
-               else                                  // If not receiving, wait a bit longer t give L3 a change
+               } else {                                  // If not receiving, wait a bit longer t give L3 a change
+                  l2wait[2]++;
                   usleep(1000);
+               }
          }   // End   while (svc_req_L2 == ON)
       }  // End for line = 0 ---> MAX_LINES          // End of scanning one line, next please...
       {
@@ -967,13 +981,33 @@ void *CS2_thread(void *arg) {
                   uint64_t const nowt = sp_tsc();
                   if (tw_last) {
                      double const secs = (double)(nowt - tw_last) / (1980.0*1000000.0);
-                     printf("\rTWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f\n",
+                     printf("\rTWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
                             tw_count[0]/secs, tw_count[1]/secs, tw_count[2]/secs,
                             tw_count[3]/secs, tw_count[4]/secs, tw_count[5]/secs,
-                            tw_count[6]/secs);
+                            tw_count[6]/secs, tw_count[7]/secs,
+                            l2wait[0]/secs, l2wait[1]/secs, l2wait[2]/secs,
+                            lvl_hist[0]/secs, lvl_hist[1]/secs, lvl_hist[2]/secs,
+                            lvl_hist[3]/secs, lvl_hist[4]/secs, lvl_hist[5]/secs);
+                  printf("\rL3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
+                         l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
+                         l3_why[3]/secs, l3_why[4]/secs);
+                  for (int z = 0; z < 5; z++) l3_why[z] = 0;
                   }
+                  printf("\rLVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
+                         lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/2100.0 : 0.0,
+                         lvl_hist[1] ? lvl_tsc[1]/(double)lvl_hist[1]/2100.0 : 0.0,
+                         lvl_hist[2] ? lvl_tsc[2]/(double)lvl_hist[2]/2100.0 : 0.0,
+                         lvl_hist[3] ? lvl_tsc[3]/(double)lvl_hist[3]/2100.0 : 0.0,
+                         lvl_hist[4] ? lvl_tsc[4]/(double)lvl_hist[4]/2100.0 : 0.0,
+                         lvl_hist[5] ? lvl_tsc[5]/(double)lvl_hist[5]/2100.0 : 0.0);
+                  for (int z = 0; z < 6; z++) lvl_tsc[z] = 0;
                   tw_last = nowt;
                   for (int z = 0; z < 8; z++) tw_count[z] = 0;
+                  for (int z = 0; z < 3; z++) l2wait[z]   = 0;
+                  /* lvl_hist too -- it was cumulative while everything
+                     beside it was per-interval, which read as millions
+                     per second. */
+                  for (int z = 0; z < 6; z++) lvl_hist[z] = 0;
                }
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
                   printf("\rSCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
