@@ -102,6 +102,16 @@
 
 #include "sim_defs.h"
 #include "i3705_defs.h"
+#if defined(__GENODE__)
+/* Genode has no SYS_gettid and the number is only ever printed. pthread_self
+   is a pointer here, so it is cast rather than formatted as one. */
+#include <pthread.h>
+#define THREAD_ID()  ((long)(unsigned long)pthread_self())
+#else
+#include <sys/syscall.h>
+#define THREAD_ID()  syscall(SYS_gettid)
+#endif
+
 #include "i3705_sdlc.h"
 #include "i3705_scanner.h"
 #include "i3705_Eregs.h"               /* External regs defs */
@@ -183,7 +193,7 @@ void *CS2_thread(void *arg) {
    unsigned char receivedChar[MAX_LINES], transmitChar;
    int ret;
 
-   fprintf (stderr, "\rCS-T2: Thread %ld started succesfully...\n", syscall(SYS_gettid));
+   fprintf (stderr, "\rCS-T2: Thread %ld started succesfully...\n", THREAD_ID());
 
    // core_id = 1 (CPU), 2 (SCAN), 3 (SDLC)
 
@@ -209,6 +219,33 @@ void *CS2_thread(void *arg) {
    // ********************************************************************
    if (Sdbg_flag == OFF) {
       S_trace = fopen("trace_S.log", "w");
+#if defined(__GENODE__)
+      /*
+       * The trace files are relative paths, so they land at the VFS root,
+       * and a component whose root is a set of ROM nodes has nowhere to
+       * put them. fopen then returns NULL and the very next line is an
+       * unguarded fprintf to it -- which is an "illegal READ at address
+       * 0xa0" from whichever thread got there first, and says nothing
+       * about a log file.
+       *
+       * /dev/log rather than /dev/null, so a scenario that asks for the
+       * trace can actually read it: the VOLUME is gated by Sdbg_reg, which
+       * is 0x00 here and stays that way unless the 3705 config file says
+       * otherwise --
+       *
+       *     d debugS 02      trace scanner activities
+       *     d debugS 04      trace line I/O buffers
+       *     d debugS 06      both
+       *
+       * -- so the default costs one banner at start-up and nothing after.
+       * /dev/null would keep every fprintf valid too, and did, but a trace
+       * that is discarded is no use for finding out why a line is silent.
+       */
+      if (S_trace == NULL)
+         S_trace = fopen("/dev/log", "w");
+      if (S_trace == NULL)
+         S_trace = fopen("/dev/null", "w");
+#endif
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       fprintf(S_trace, "\r     ****** 3705 SCANNER log file ******\n"
@@ -223,9 +260,35 @@ void *CS2_thread(void *arg) {
                        "        Ln = Line number n = 0 -> 9 "
                        "        y  = '>' Tx/request; '<' Rx/response \n\n",
                        currentTime->tm_mday, currentTime->tm_mon + 1, currentTime->tm_year + 1900);
+      /*
+       * Unbuffered, or the trace is invisible. S_trace is its own FILE* and
+       * nothing in this file flushes it, so with the default buffering the
+       * banner and the first several KB sit in libc until something else
+       * forces them out -- which, in a simulator that does not exit, is
+       * never. The controllers' traces call fflush after every write; this
+       * one does not, so the buffering is turned off once instead.
+       */
+      setvbuf(S_trace, NULL, _IONBF, 0);
       Sdbg_flag = ON;
    }
-   Sdbg_reg = 0x00;
+   /*
+    * DO NOT CLOBBER A DEPOSIT FROM THE CONFIG FILE.
+    *
+    * Sdbg_reg is a global, zero at load, and this assignment ran
+    * unconditionally -- after the simulator had processed the config file. So
+    *
+    *     d DEBUGS 06
+    *
+    * in 3705.cnf, which is the documented way to ask for the scanner and line
+    * traces (and which the banner a few lines above prints as the usage), was
+    * silently discarded every time, and the trace could only ever be turned
+    * on by typing at a sim> prompt this port does not have.
+    *
+    * Initialising a global that is already zero buys nothing; leaving a
+    * deposit alone buys the trace.
+    */
+   if (Sdbg_reg == 0xFFFF)
+      Sdbg_reg = 0x00;
    while (LIBready == 0)                              // If LIB structures not allocated and initialized....
       wait();                                         // ... wait until they are ready
 
