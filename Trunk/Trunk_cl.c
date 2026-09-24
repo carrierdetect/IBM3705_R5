@@ -39,9 +39,27 @@
 #include <string.h>
 #include <ifaddrs.h>
 #include <errno.h>
+#if !defined(__GENODE__)
+/*
+ * Included and never used: Trunk has no epoll call anywhere, it polls with
+ * ioctl(FIONREAD). Genode's libc has no <sys/epoll.h>, so the include alone
+ * fails the build for a facility the program does not want.
+ */
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#if defined(__GENODE__)
+/*
+ * Trunk over Genode IPC. Both of this program's ends are lines of a 3705 that
+ * is a component in the same boot image, so each is one end of a
+ * terminal_crosslink the run script has already joined -- there is no host to
+ * resolve, no port to connect to and nothing that can drop. See
+ * genode_trunk.h; the four operations are shared with the 3705 itself.
+ */
+#include "genode_trunk.h"
+#include "genode_xlink.h"
+#endif
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -258,6 +276,7 @@ void main(int argc, char *argv[]) {
    //*******************************************************************************
    // Assign IP addr and PORT numbers.
 
+#if !defined(__GENODE__)
    snprintf(portl1a, 6, "%d", LINEBASE + line1num);
    if ( (rc = getaddrinfo(host1name,portl1a,NULL,&line1ahost )) != 0 ) {
       printf("\rTrunk: Cannot resolve first 3705 address for %s\n", host1name);
@@ -288,6 +307,24 @@ void main(int argc, char *argv[]) {
        } // End if ( (rc = getaddrinfo
     } // End  if (Fdx)
 
+#endif  /* !__GENODE__ */
+
+#if defined(__GENODE__)
+   /*
+    * Four crosslinks instead of four sockets, opened once. A crosslink is
+    * connected from the moment both ends have it open, so everything below
+    * that exists to reach and keep a TCP connection -- IsSocketConnected, the
+    * connect retry, the close-and-recreate on a drop -- has nothing to do
+    * here, and the lines start RDY.
+    */
+   if (genode_trunk_open() != 0)
+      return;
+
+   line1a_fd = genode_trunk_fd(TRUNK_L1A);
+   line1b_fd = genode_trunk_fd(TRUNK_L1B);
+   line2a_fd = genode_trunk_fd(TRUNK_L2A);
+   line2b_fd = genode_trunk_fd(TRUNK_L2B);
+#else
    // Line-1 socket creation
    line1a_fd = socket(AF_INET, SOCK_STREAM, 0);
    if (line1a_fd <= 0) {
@@ -317,14 +354,21 @@ void main(int argc, char *argv[]) {
          return;
       } // End if (line2b_fd <= 0)
    } // End if (Fdx)
+#endif  /* !__GENODE__ */
 
 
    // Initialize state values
+#if defined(__GENODE__)
+   line1state = RDY;    /* a crosslink is connected or the open failed */
+   line2state = RDY;
+#else
    line1state = NRDY;   // Line initially not ready
    line2state = NRDY;   // Line initially not ready
+#endif
    //raiseRTS = ON;       // RTS should be raised after lines are connected
 
    while (1) {
+#if !defined(__GENODE__)
       if (line1state == NRDY) {
          // Line and signal sockets have been created. The connection to the LIBs will be done next
          if (!(IsSocketConnected(line1a_fd))) {
@@ -358,6 +402,8 @@ void main(int argc, char *argv[]) {
          }  // End if ((rc1 == 0) && (rc2 == 0))
       }  // End  if (line12state == NRDY)
 
+#endif  /* !__GENODE__ */
+
       if ((line1state == RDY) && (line2state == RDY)) {
          //*****************************************************************************************
          // Check if there is data to be received from line 1
@@ -365,6 +411,15 @@ void main(int argc, char *argv[]) {
          //*****************************************************************************************
          pendingrcv = 0;
 
+#if defined(__GENODE__)
+         /*
+          * xlink_avail instead of ioctl(FIONREAD): this lwIP has no ioctl at
+          * all, and a crosslink cannot drop, so the re-establish arm below is
+          * unreachable here. A zero-length answer means "nothing yet", never
+          * "the peer has gone" -- see results/comm3705-3270-session.txt.
+          */
+         pendingrcv = (xlink_avail(line1a_fd, 0) > 0);
+#else
          if (IsSocketConnected(line1a_fd)) {
             rc = ioctl(line1a_fd, FIONREAD, &pendingrcv);
             // *** Keep the below for now; under investgation ***
@@ -391,9 +446,15 @@ void main(int argc, char *argv[]) {
                }  // End if (line_fd <= 0)
             } // End if (Fdx)
          }  // End if (IsSocketConnected(line1a_fd))
+#endif  /* !__GENODE__ */
 
          if (pendingrcv > 0) {
+#if defined(__GENODE__)
+            LINErlen = xlink_read(line1a_fd, LINE_rbuf, sizeof(LINE_rbuf));
+            if (LINErlen <= 0) continue;   /* quiet, not closed */
+#else
             LINErlen = read(line1a_fd, LINE_rbuf, sizeof(LINE_rbuf));
+#endif
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s Line 1 -> Line 2 Transmit Buffer: ",TimeStamp());
                for (int i = 0; i < LINErlen; i ++) {
@@ -403,10 +464,14 @@ void main(int argc, char *argv[]) {
                fflush(T_trace);
             }  // End if debug
             // Forward the received data to the other line
+#if defined(__GENODE__)
+            rc = xlink_write(Fdx2 ? line2b_fd : line2a_fd, LINE_rbuf, LINErlen);
+#else
             if (Fdx2)
                rc = send(line2b_fd, LINE_rbuf, LINErlen, 0);
             else
                rc = send(line2a_fd, LINE_rbuf, LINErlen, 0);
+#endif
             if (LINErlen != rc) {
                if (Tdbg_flag == ON)
                   fprintf(T_trace, "%s Trunk: Line 2 Transmit buffer size %d bytes, actual transmitted %d bytes\n",TimeStamp(),LINErlen,rc);
@@ -418,6 +483,15 @@ void main(int argc, char *argv[]) {
          // If the connection was lost, try to re-establish
          //*****************************************************************************************
          pendingrcv = 0;
+#if defined(__GENODE__)
+         /*
+          * xlink_avail instead of ioctl(FIONREAD): this lwIP has no ioctl at
+          * all, and a crosslink cannot drop, so the re-establish arm below is
+          * unreachable here. A zero-length answer means "nothing yet", never
+          * "the peer has gone" -- see results/comm3705-3270-session.txt.
+          */
+         pendingrcv = (xlink_avail(line2a_fd, 0) > 0);
+#else
          if (IsSocketConnected(line2a_fd)) {
             rc = ioctl(line2a_fd, FIONREAD, &pendingrcv);
          } else {
@@ -441,9 +515,15 @@ void main(int argc, char *argv[]) {
                }  // End if (line_fd <= 0)
             } // End if (Fdx)
          }  // End if (IsSocketConnected(line2a_fd))
+#endif  /* !__GENODE__ */
 
          if (pendingrcv > 0) {
+#if defined(__GENODE__)
+            LINErlen = xlink_read(line2a_fd, LINE_rbuf, sizeof(LINE_rbuf));
+            if (LINErlen <= 0) continue;   /* quiet, not closed */
+#else
             LINErlen = read(line2a_fd, LINE_rbuf, sizeof(LINE_rbuf));
+#endif
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s Line 2 -> Line 1 Transmit Buffer: ",TimeStamp());
                for (int i = 0; i < LINErlen; i ++) {
@@ -453,10 +533,14 @@ void main(int argc, char *argv[]) {
                fflush(T_trace);
             }  // End if debug
             // Forward the received data to the other line
+#if defined(__GENODE__)
+            rc = xlink_write(Fdx1 ? line1b_fd : line1a_fd, LINE_rbuf, LINErlen);
+#else
             if (Fdx1)
                rc = send(line1b_fd, LINE_rbuf, LINErlen, 0);
             else
                rc = send(line1a_fd, LINE_rbuf, LINErlen, 0);
+#endif
             if (LINErlen != rc) {
                if (Tdbg_flag == ON)
                   fprintf(T_trace, "%s Trunk: Line 1 Transmit buffer size %d bytes, actual transmitted %d bytes\n",TimeStamp(),LINErlen,rc);
