@@ -94,8 +94,44 @@
 #include <stdbool.h>
 #include "sim_defs.h"
 #include "i3705_defs.h"
+#if defined(__GENODE__)
+/* Genode has no SYS_gettid and the number is only ever printed. pthread_self
+   is a pointer here, so it is cast rather than formatted as one. */
+#include <pthread.h>
+#define THREAD_ID()  ((long)(unsigned long)pthread_self())
+#else
+#include <sys/syscall.h>
+#define THREAD_ID()  syscall(SYS_gettid)
+#endif
+
 #include <sys/time.h>
 #include <time.h>
+#include <pthread.h>
+#if defined(__GENODE__)
+
+/*
+ * On Genode a line is a terminal_crosslink, not a listening socket.
+ *
+ * Upstream binds four listeners on 37520-37523 -- one per line -- and a
+ * 3274, 3271, DLSw or Trunk connects to one of them. Here the crosslinks are
+ * opened before the simulator starts and genode_ca.c holds them, so the
+ * listen, the accept and the interface lookup that chose an address to bind
+ * all go away together. See ../../COMM3705.md.
+ *
+ * Two redirections, for the same reasons as in i3705_chan_T2.c: a crosslink
+ * write returns a short count rather than blocking, and its fd is not a
+ * socket. The reads on a line are already "whatever arrived", which is what
+ * genode_ca_read gives.
+ *
+ * ncurses is not here either. The LIB panel draws line status in a terminal
+ * this component does not have, and the same information belongs in the
+ * telemetry -- so the four drawing functions below are empty rather than
+ * pulling a curses port in to render to nothing.
+ */
+#include "genode_ca.h"
+#define send(fd, buf, len, flags)  genode_ca_write((fd), (buf), (int)(len))
+#define read(fd, buf, len)         genode_ca_read ((fd), (buf), (int)(len))
+#else
 #include <ifaddrs.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -103,8 +139,8 @@
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <ncurses.h>
+#endif
 
 #define RED_BLACK    1
 #define GREEN_BLACK  2
@@ -137,7 +173,9 @@ struct LIBLine {
    int8     prevPCF;                   // Remember Previous PCF
 } *LIBline[MAX_LINES];
 
+#if !defined(__GENODE__)
 struct epoll_event event, events[MAX_LINES];
+#endif
 
 pthread_mutex_t line_lock;             // Line lock
 pthread_mutex_t rs232_lock;            // RS232 signal lock
@@ -168,6 +206,9 @@ int8 shwlib = 0;                                               /* Dispaly LIB Pa
 // Function to build the LIB display.
 // **********************************************************
 void LIBpanel() {
+#if defined(__GENODE__)
+    return;
+#else
 
     stringAtXY(0, 26, "IBM 3705 Line Interface Base", WHITE_BLACK);
     stringAtXY(1,  0, "----------------------------------------", GREEN_BLACK);
@@ -178,6 +219,7 @@ void LIBpanel() {
     }
     stringAtXY(22,70,  "HOME=exit", GREEN_BLACK);
     return;
+#endif
 }
 
 // **********************************************************
@@ -185,6 +227,9 @@ void LIBpanel() {
 // If the HOME key is presserd, the panlke is closed.
 // **********************************************************
 void LIBpanel_Updt() {
+#if defined(__GENODE__)
+   return;
+#else
    int key, line;
     key = getch();
     if ((key != KEY_HOME) && (key != 0x007E)) {             /* 0x007E needed for putty  */
@@ -206,6 +251,7 @@ void LIBpanel_Updt() {
        freopen("/dev/tty", "w", stdout); /* resume normal console output */
     }
     return;
+#endif
 }
 
 //*********************************************************************
@@ -238,6 +284,11 @@ static int ShiftLeft(char *buffer, int len)  {
 // Function to check if socket is (still) connected                   *
 //*********************************************************************
 static bool IsSocketConnected(int sockfd) {
+#if defined(__GENODE__)
+   /* A crosslink is connected for as long as it is open; see the same
+      function in i3705_chan_T2.c. */
+   return (sockfd > 0) ? true : false;
+#else
    int rc;
    struct sockaddr_in peer_addr;
    int addrlen = sizeof(peer_addr);
@@ -249,6 +300,7 @@ static bool IsSocketConnected(int sockfd) {
       return false;
    }
    return true;
+#endif
 }
 
 //*******************************************************************************************
@@ -300,7 +352,26 @@ int ReadLIB(int k) {
    if (LIBline[k]->d327x_fd > 0) {                                  // If there is a connection...
       if (IsSocketConnected(LIBline[k]->d327x_fd)) {                // ...and if it is still alive...
          pendingrcv = 0;
+#if defined(__GENODE__)
+         /* TIMEOUT 0, NOT 10, AND THE DIFFERENCE IS THE WHOLE LINE.
+          *
+          * Upstream asks ioctl(FIONREAD) here, which answers instantly with a
+          * byte count. This is the SCANNER asking for the next received
+          * CHARACTER (proc_LIBrdata calls it whenever the line buffer is
+          * empty), so it is on the hot path and is reached for every line on
+          * every scan cycle. A 10 ms wait turns "is there a character?" into
+          * a sleep, and with four lines that is up to 40 ms of dead time per
+          * cycle. The receive side then cannot keep up with the line: bytes
+          * all arrive correctly, but the far NCP's N(R) stops advancing, it
+          * retransmits, and the remote load dies on FRMR.
+          *
+          * poll() with a zero timeout is what FIONREAD meant: ask, do not
+          * wait. */
+         pendingrcv = genode_ca_avail(LIBline[k]->d327x_fd, 0);
+         rc = 0;
+#else
          rc = ioctl(LIBline[k]->d327x_fd, FIONREAD, &pendingrcv);   // ...check for any data in the TCP buffer
+#endif
          if (pendingrcv > 0) {
             pthread_mutex_lock(&line_lock);
             LIBline[k]->LIBrlen = read(LIBline[k]->d327x_fd, LIBline[k]->LIB_rbuf, BUFLEN_327x); // If data available, read it
@@ -308,6 +379,11 @@ int ReadLIB(int k) {
          }  // End if (pendingrcv > 0)
          return 0;                                                  // return
       } else {
+#if defined(__GENODE__)
+         /* A crosslink does not disconnect, so this branch is unreachable;
+            it is left rather than removed so the native build is unchanged. */
+         return -1;
+#else
          // Close the connection and add a new polling event, to allow for a re-connect.
          close (LIBline[k]->d327x_fd);
          LIBline[k]->d327x_fd = 0;
@@ -321,6 +397,7 @@ int ReadLIB(int k) {
             close(LIBline[k]->epoll_fd);
             return -1;
          }
+#endif
       }  // End if IsSocketConnected
       return -1;
    }  // End  if (LIBline[k]->d327x_fd > 0)
@@ -440,11 +517,13 @@ void *LIB_thread(void *arg)
    int    intvl = 3;               /* Subsequent probes after 3 sec  */
    int    cntpkt = 3;              /* Timeout after 3 failed probes  */
    int    timeout = 1000;
+#if !defined(__GENODE__)
    struct sockaddr_in sin, *sin2;  /* bind socket address structure  */
    struct ifaddrs *nwaddr, *ifa;   /* interface address structure    */
    char   *ipaddr;
+#endif
 
-   printf("\rLIB: Thread %d started succesfully...\n", syscall(SYS_gettid));
+   printf("\rLIB: Thread %d started succesfully...\n", THREAD_ID());
 
    for (int j = 0; j < MAX_LINES; j++) {
       LIBline[j] =  malloc(sizeof(struct LIBLine));
@@ -454,6 +533,37 @@ void *LIB_thread(void *arg)
       LIBline[j]->LIBsync = 0;
    }  // End for j = 0
    LIBready = 1;             /* LIB structures allocated and initialized */
+
+#if defined(__GENODE__)
+   /*
+    * The lines, already open.
+    *
+    * Upstream this is a bind, a listen and an epoll registration per line,
+    * and then an accept when a 3274, 3271, DLSw or Trunk connects. All of it
+    * is replaced by taking the crosslink the component config named: a line
+    * with a crosslink IS a line with something on the end of it, so DCD and
+    * RI go up here rather than in an accept that will never happen.
+    *
+    * A line with no crosslink stays at fd 0, which is exactly the state an
+    * unconnected line had before, and every caller already tests for it.
+    */
+   for (int j = 0; j < MAX_LINES; j++) {
+      LIBline[j]->d327x_fd = genode_line_fd((unsigned)j);
+      if (LIBline[j]->d327x_fd < 0) {
+         LIBline[j]->d327x_fd = 0;
+         continue;
+      }
+      RS232[j] |= (DCD | RI);                      // DCD and Ring on
+      printf("\rLIB: Line-%d attached\n", j + LIBLBASE);
+   }
+
+   while (1) {
+      for (int k = 0; k < MAX_LINES; k++)
+         ReadSig(k);
+      usleep(50000);
+   }
+   return NULL;
+#else
    getifaddrs(&nwaddr);      /* Get TCP network address */
    for (ifa = nwaddr; ifa != NULL; ifa = ifa->ifa_next) {
       if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, "lo")) {
@@ -544,6 +654,7 @@ void *LIB_thread(void *arg)
    }  // End while(1)
 
    return NULL;
+#endif
 }
 
 /*-------------------------------------------------------------------*/
@@ -562,6 +673,10 @@ static char * TimeStamp() {
 }
 
 void LIBpanel_Init() {
+#if defined(__GENODE__)
+   shwlib = 0;
+   return;
+#else
    // *****************************************************************************************
    // Because SIMH has been interrupted to set the swwlib value to 1 (= show panel), we need to
    // hold of showing the panel, so "c" (continue) can be entered.
@@ -612,6 +727,7 @@ void LIBpanel_Init() {
    LIBpanel();                                         /* build the panel                */
    refresh();                                          /* show it on the screen          */
    shwlib = 2;                                         /* swithc to update mode          */
+#endif
  }
 
 // ******************************************************************
@@ -619,6 +735,10 @@ void LIBpanel_Init() {
 // ******************************************************************
 
 static void stringAtXY (int x, int y, char *buf, int colour) {
+#if defined(__GENODE__)
+   (void)x; (void)y; (void)buf; (void)colour;
+   return;
+#else
 
    wmove(stdscr, x, y);
    attron(COLOR_PAIR(colour));
@@ -626,6 +746,7 @@ static void stringAtXY (int x, int y, char *buf, int colour) {
    printw("%s",buf);
    attroff(COLOR_PAIR(colour));
    return;
+#endif
 }
 
 // ******************************************************************
@@ -633,11 +754,16 @@ static void stringAtXY (int x, int y, char *buf, int colour) {
 // ******************************************************************
 
 static void integerAtXY (int x, int y, int value, int colour) {
+#if defined(__GENODE__)
+   (void)x; (void)y; (void)value; (void)colour;
+   return;
+#else
 
    wmove(stdscr,x,y);
    attron(COLOR_PAIR(colour));
    printw("%d", value);
    attroff(COLOR_PAIR(colour));
    return;
+#endif
 }
 
