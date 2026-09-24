@@ -43,7 +43,19 @@
 #include <sys/time.h>
 #include <time.h>
 #include <errno.h>
+#if !defined(__GENODE__)
 #include <sys/epoll.h>
+#else
+/*
+ * No epoll here, and none wanted: it watches ONE descriptor, which poll
+ * does. Genode's libc has no <sys/epoll.h> at all, so the include alone
+ * fails the build. Same substitution as patches 0007 and 0008.
+ */
+#include <poll.h>
+#include "genode_line.h"
+#include "genode_xlink.h"
+extern void genode_pace_us(unsigned us);
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -733,9 +745,13 @@ void main(int argc, char *argv[]) {
    struct         sockaddr_in dlswaddr;  /* Our DLSw connection               */
    struct         sockaddr_in peeraddr;  /* Peer DLSw connection              */
    struct         sockaddr_in inaddr;    /* Inbound peer, as accept() fills it*/
+#if !defined(__GENODE__)
    struct         epoll_event event, events[1];
+#endif
    in_addr_t      lineip;                /* DLSw line listening address       */
+#if !defined(__GENODE__)
    int            epoll_fd;              /* Event polling socket              */
+#endif
    int            sockopt;               /* Used for setsocketoption          */
    int            pendingrcv;            /* pending data on the socket        */
    int            event_count;           /* # events received                 */
@@ -839,6 +855,19 @@ void main(int argc, char *argv[]) {
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       T_trace = fopen("trace_DLSw.log", "w");
+#if defined(__GENODE__)
+      /*
+       * The same trap as the scanner's and the trunk's: a relative path
+       * lands at the VFS root, a component whose root is a set of ROM
+       * nodes has nowhere to put it, fopen returns NULL and the fprintf
+       * two lines down dereferences it. Unbuffered as well, or a
+       * nearly-silent link -- which is what you turn this on to look at
+       * -- never fills the buffer and writes nothing at all.
+       */
+      if (T_trace == NULL) T_trace = fopen("/dev/log", "w");
+      if (T_trace == NULL) T_trace = fopen("/dev/null", "w");
+      if (T_trace != NULL) setvbuf(T_trace, NULL, _IONBF, 0);
+#endif
       fprintf(T_trace, "     ****** DLSw log file ****** \n\n"
                        "     ******             Date: %02d/%02d/%04d              ****** \n\n"
                        "     DLSw_rt -d : trace all DLSw activities\n",
@@ -850,12 +879,29 @@ void main(int argc, char *argv[]) {
    //*******************************************************************************
    //* Prepare the SDLC line connection
    //*******************************************************************************
+#if defined(__GENODE__)
+   /*
+    * The lines are crosslinks the component already opened, not sockets
+    * to create and connect. Upstream takes TWO adjacent 3705 lines --
+    * SDLCBASE+linenum to send and +1 to receive -- and
+    * genode_line_declare(line, fdx) says exactly that, so fd() and
+    * fd_sec() are the pair. Everything below that creates, resolves,
+    * connects or retries is gone: a crosslink has no peer to find and
+    * cannot drop.
+    */
+   line_fd = genode_line_fd();
+   if (line_fd < 0) {
+      printf("\rDLSw: no 3705 line\n");
+      return;
+   }
+#else
    // SDLC line socket creation
    line_fd = socket(AF_INET, SOCK_STREAM, 0);
    if (line_fd <= 0) {
       printf("\rDLSw: Cannot create line socket\n");
       return;
    }
+#endif
    // If FDX create a second SDLC line socket
    if (Fdx) {
       line2_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -907,6 +953,7 @@ void main(int argc, char *argv[]) {
       printf("\rDLSw: Inbound socket listen failed %s\n", strerror(errno));
       exit(-1);
    }
+#if !defined(__GENODE__)
    // Add polling events for the port
    epoll_fd = epoll_create(1);
    if (epoll_fd == -1) {
@@ -920,6 +967,10 @@ void main(int argc, char *argv[]) {
       close(epoll_fd);
       exit(-3);
    }
+#else
+   /* One descriptor, so poll replaces the epoll set-up entirely;
+      the wait below becomes a poll on dlsw_sfd. */
+#endif
    printf("\rDLSw: DLSw ready, waiting for connection on TCP port %d\n\r", DLSW_PORT );
 
    //*************************************************************************************
@@ -956,7 +1007,13 @@ void main(int argc, char *argv[]) {
       // If the connection is not active yet or if the connection was lost, try to re-establish
       //*****************************************************************************************
       if (conrfd == OFF) {
+#if defined(__GENODE__)
+         {  struct pollfd pfd = { dlsw_sfd, POLLIN, 0 };
+            event_count = (poll(&pfd, 1, 50) > 0 &&
+                           (pfd.revents & POLLIN)) ? 1 : 0; }
+#else
          event_count = epoll_wait(epoll_fd, events, 1, 50);
+#endif
          if ((event_count > 0) && (dlsw_rfd < 1)) {
             /* Accept */
             /*
@@ -1010,7 +1067,17 @@ void main(int argc, char *argv[]) {
 
       if (conrfd == ON) {
          pendingrcv = 0;
+#if defined(__GENODE__)
+         /* The router side is still a socket, but this lwIP has no ioctl
+            at all -- see genode_ca.h. poll answers the same question.
+            A read of zero here is NOT a closed peer (commit 7807cb5);
+            the SocketReadAct arms below already assume that. */
+         {  struct pollfd pfd = { dlsw_rfd, POLLIN, 0 };
+            pendingrcv = (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN));
+            rc = 0; }
+#else
          rc = ioctl(dlsw_rfd, FIONREAD, &pendingrcv);
+#endif
          if ((pendingrcv < 1) && (SocketReadAct(dlsw_rfd))) rc = 0;
          if (rc < 0) {                      // Retry once to account for timing delays in TCP.
             if ((pendingrcv < 1) && (SocketReadAct(dlsw_wfd))) rc = -1;
@@ -1075,8 +1142,18 @@ void main(int argc, char *argv[]) {
 
       if (conlfd == ON) {
          pendingrcv = 0;
+#if defined(__GENODE__)
+         /* A crosslink has no ioctl and cannot drop, so the connected
+            test and the re-establish arm below are both unreachable.
+            Timeout 0 for the same reason i3705_lib.c uses 0 on its line
+            path -- a longer one there stalled the load outright. */
+         if (1) {
+            pendingrcv = xlink_avail(line_fd, 0);
+            rc = 0;
+#else
          if (IsSocketConnected(line_fd)) {
             rc = ioctl(line_fd, FIONREAD, &pendingrcv);
+#endif
             // *** Keep the below for now; under investgation ***
             //if ((pendingrcv < 1) && (SocketReadAct(line_fd))) rc = -1;
             //if (rc < 0) {                      // Retry once to account for timing delays in TCP.
