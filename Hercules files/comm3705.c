@@ -75,6 +75,138 @@ static BYTE commadpt_immed_command[256]=
 /*-----------------------------------------------------------------*/
 /* PARSER TABLES                                                   */
 /*-----------------------------------------------------------------*/
+#if defined(__GENODE__)
+/*-------------------------------------------------------------------*/
+/* The channel adapter over Genode IPC rather than TCP                */
+/*-------------------------------------------------------------------*/
+/*                                                                   */
+/* The 3705 end of this is i3705_chan_T2.c, patched the same way; the */
+/* design and the reasoning are in port/COMM3705.md. Here the two     */
+/* TCP connections a channel is made of become two terminal_crosslink */
+/* sessions, and the device statement loses its address and its port  */
+/* without gaining anything:                                         */
+/*                                                                   */
+/*   0660 3705 adaptip=127.0.0.1 port=37051      native, TCP          */
+/*   0660 3705                                   Genode, IPC          */
+/*                                                                   */
+/* The two nodes are /dev/ca<devnum>_bus and /dev/ca<devnum>_tag, by  */
+/* convention, exactly as genode_shrd.c opens /dev/arb<devnum>. This  */
+/* file took two PATH arguments first, and that was wrong three times */
+/* over: two arguments for a thing that is always one pair; a path in */
+/* hercules.cnf for something the guest's configuration does not      */
+/* decide and nothing checks; and a pairing stated rather than        */
+/* structural, so crossing bus with another channel's tag, or naming  */
+/* one and not the other, were both spellable.                       */
+/*                                                                   */
+/* Which crosslink this partition actually reaches is routing, and    */
+/* Genode already says routing with a session label matched against a */
+/* policy -- see "The path that went away" in port/SHARED-DASD.md,    */
+/* which settled the same question for the arbitrated volume.        */
+/*                                                                   */
+/* The name is per-device because the SESSION is per-device, and it   */
+/* is local to this partition: the 3705 calls the same crosslink CA1  */
+/* channel A, because that is what it is at that end. Two names for   */
+/* the two ends of one pipe is the shape shared DASD already has,     */
+/* where one lock is arb0120 to one partition and arb0220 to another. */
+/*                                                                   */
+/* adaptip= and port= are still parsed, and are simply not used -- a  */
+/* configuration carried over from a native run says what it meant    */
+/* and is told what is wrong, rather than failing on an unrecognised  */
+/* keyword.                                                          */
+/*                                                                   */
+/* The two-byte device address this end sends on the bus after        */
+/* connecting is kept exactly: it is what makes the 3705 print        */
+/* "CA1: Connected to device 0660", and a crosslink buffers it, so    */
+/* the emulator no longer has to be started second.                   */
+/*                                                                   */
+/* send() and recv() are redirected rather than rewritten at each     */
+/* call, for one reason that matters: terminal_crosslink's write      */
+/* RETURNS A SHORT COUNT when its ring is full and never blocks, so a */
+/* plain write drops the tail of a channel message with no error      */
+/* anywhere. ipc_write loops. ipc_read returns what is there, which   */
+/* is the semantic every recv() in this file already had.             */
+/*-------------------------------------------------------------------*/
+
+#include <poll.h>
+
+static int ipc_write(int fd, const void *buf, int len)
+{
+    const char *p = (const char*) buf;
+    int sent = 0;
+
+    if (fd < 0) return -1;
+
+    while (sent < len)
+    {
+        int const rc = (int) write( fd, p + sent, (size_t)(len - sent) );
+        if (rc < 0) { if (errno == EINTR) continue; return -1; }
+        if (rc == 0) return -1;
+        sent += rc;
+    }
+    return sent;
+}
+
+static int ipc_read(int fd, void *buf, int len)
+{
+    int rc;
+
+    if (fd < 0) return -1;
+
+    do { rc = (int) read( fd, buf, (size_t)len ); }
+    while (rc < 0 && errno == EINTR);
+
+    return rc;
+}
+
+/*
+ * Is there anything to read, without blocking to find out.
+ *
+ * The attention thread waits on the tag for the life of the device, and on
+ * Genode a thread parked in a blocking VFS read is not free: the libc has one
+ * context to service everybody, and the emulator's 3270 console devices reach
+ * their clients through lwIP on that same libc. DASD does not -- it is a
+ * Block session -- so an MVS IPL completes normally and only the console path
+ * starves, which is why this surfaced as
+ *
+ *     IST093I  AJRP     ACTIVE
+ *
+ * and then silence: VTAM activating L3274, the local non-SNA major node for
+ * the 3270s at 00C0-00C6, with nothing able to answer it.
+ */
+static int ipc_avail(int fd)
+{
+    struct pollfd p;
+
+    if (fd < 0) return 0;
+
+    p.fd = fd; p.events = POLLIN; p.revents = 0;
+
+    if (poll( &p, 1, 0 ) <= 0) return 0;
+
+    return (p.revents & POLLIN) ? 1 : 0;
+}
+
+static int ipc_read_exact(int fd, void *buf, int len)
+{
+    char *p = (char*) buf;
+    int got = 0;
+
+    if (fd < 0) return -1;
+
+    while (got < len)
+    {
+        int const rc = (int) read( fd, p + got, (size_t)(len - got) );
+        if (rc < 0) { if (errno == EINTR) continue; return -1; }
+        if (rc == 0) return -1;
+        got += rc;
+    }
+    return got;
+}
+
+#define send(fd, buf, len, flags)  ipc_write((fd), (buf), (int)(len))
+#define recv(fd, buf, len, flags)  ipc_read ((fd), (buf), (int)(len))
+#endif
+
 static PARSER ptab[] = {
     {"port",    "%s"},
     {"adaptip", "%s"},
@@ -104,6 +236,10 @@ struct COMMADPT
     BYTE cswpending;            /* indicate a CSW is pending                */
     int busfd;                  /* Communication socket for ccw/data        */
     int tagfd;                  /* Communication socket for attn            */
+#if defined(__GENODE__)
+    char buspath[32];           /* ...a crosslink node here, not a socket   */
+    char tagpath[32];
+#endif
     COND ipc;                   /* I/O <-> thread IPC condition EVB         */
     COND ipc_halt;              /* I/O <-> thread IPC HALT special EVB      */
     LOCK lock;                  /* COMMADPT lock                            */
@@ -181,6 +317,15 @@ struct CSW {
 // This subroutine waits 1 usec
 // ************************************************************
 void wait1us() {
+   /* NOT ONE MICROSECOND ON GENODE, and nothing here can make it one:
+      nanosleep floors every non-zero request at 1 ms
+      (repos/libports/src/lib/libc/sleep.cc). So the caller below --
+      while (dev->busy || IOPENDING(dev)) wait1us(); -- polls at 1 kHz
+      rather than 1 MHz and counts its "delay" in milliseconds. That is the
+      right direction for a cooperative libc, where a microsecond spin would
+      be a thousand monitor round trips per millisecond, but the name lies
+      and the arithmetic downstream of it is out by 1000. Comment only; the
+      code is upstream's. */
    usleep(1);
    return;
 }
@@ -192,6 +337,13 @@ static int write_adpt(BYTE* bufferp, int len, COMMADPT* ca);
 // ************************************************************
 static int IsSocketConnected(int sockfd, U16 ssid, U16 devnum)
 {
+#if defined(__GENODE__)
+   /* A crosslink is connected for as long as it is open. The 3705 end of
+      this says the same thing for the same reason; see COMM3705.md on what
+      a restart mid-session would need and does not have. */
+   (void)ssid; (void)devnum;
+   return (sockfd > 0) ? 1 : 0;
+#else
    int rc;
    struct sockaddr_in ccu_addr;
    socklen_t addrlen = sizeof(ccu_addr);
@@ -205,12 +357,53 @@ static int IsSocketConnected(int sockfd, U16 ssid, U16 devnum)
       return false;
    }
    return true;
+#endif
 }
 
 // ********************************************************************
 // Function to enable TCP socket and connect to Remote channel adapter
 // ********************************************************************
 static int connect_adpt(COMMADPT *ca) {
+#if defined(__GENODE__)
+   char cua[2];
+   int  rc;
+
+   MSGBUF( ca->buspath, "/dev/ca%04X_bus", ca->dev->devnum );
+   MSGBUF( ca->tagpath, "/dev/ca%04X_tag", ca->dev->devnum );
+
+   /* Bus first, then tag. The ORDER is the protocol: the 3705 took the
+      first of two connections on one port as the bus and the second as the
+      tag, and although a crosslink pair has no accept to order, keeping the
+      opens in that sequence keeps the two ends describing the same thing. */
+   ca->busfd = open( ca->buspath, O_RDWR );
+   if (ca->busfd < 0) {
+      logmsg("CCBUS002E %1d:%04X: cannot open %s: %s\n",
+             ca->dev->ssid, ca->dev->devnum, ca->buspath, strerror(errno));
+      return(-1);
+   }
+   ca->tagfd = open( ca->tagpath, O_RDWR );
+   if (ca->tagfd < 0) {
+      logmsg("CCTAG002E %1d:%04X: cannot open %s: %s\n",
+             ca->dev->ssid, ca->dev->devnum, ca->tagpath, strerror(errno));
+      close( ca->busfd ); ca->busfd = -1;
+      return(-1);
+   }
+   logmsg("CCTAG003I %1d:%04X: tag connection established on %s\n",
+          ca->dev->ssid, ca->dev->devnum, ca->tagpath);
+
+   cua[0] = (ca->devnum & 0x0000FF00) >> 8;
+   cua[1] = (ca->devnum & 0x000000FF);
+
+   rc = ipc_write( ca->busfd, cua, 2 );
+   if (rc != 2) {
+      logmsg("CCBUS004E %1d:%04X: device address not delivered\n",
+             ca->dev->ssid, ca->dev->devnum);
+      return(-1);
+   }
+   logmsg("CCBUS003I %1d:%04X: bus connection established on %s\n",
+          ca->dev->ssid, ca->dev->devnum, ca->buspath);
+   return(0);
+#else
 
   int rc;
   char cua[2];
@@ -282,6 +475,7 @@ static int connect_adpt(COMMADPT *ca) {
    }
 
    return(0);
+#endif
 }
 // ********************************************************************
 // Function to close the bus and tag TCP sockets
@@ -290,13 +484,21 @@ static void close_adpt(COMMADPT *ca) {
 
    // Bus socket close
    if (ca->busfd > 0) {
+#if defined(__GENODE__)
+      close(ca->busfd);
+#else
       shutdown(ca->busfd, SHUT_RDWR);
+#endif
       ca->busfd = -1;
       logmsg("CCBUS0016I %1d:%04X: bus connection closed\n",  ca->dev->ssid, ca->dev->devnum);
    }
    // Tag socket close
    if (ca->tagfd > 0) {
+#if defined(__GENODE__)
+      close(ca->tagfd);
+#else
       shutdown(ca->tagfd, SHUT_RDWR);
+#endif
       ca->tagfd = -1;
       logmsg("CCTAG0016I %1d:%04X: tag connection closed\n",  ca->dev->ssid, ca->dev->devnum);
    }
@@ -614,6 +816,16 @@ static void *CSW_adpt(void *vca) {
       }
 
       while ((IsSocketConnected(ca->tagfd, ca->dev->ssid, ca->dev->devnum)) && !ca->dev->commadpt->attn_halt) {
+#if defined(__GENODE__)
+         /* Poll, then read. See ipc_avail: blocking here holds the libc
+            context that the emulator's 3270 consoles need, and VTAM then
+            never gets past activating them. 10 ms is far below any channel
+            timing and costs nothing measurable against an idle adapter. */
+         if (!ipc_avail(ca->tagfd)) {
+            usleep(10000);
+            continue;
+         }
+#endif
          // Wait for Channel Adapter status byte
          rc = recv(ca->tagfd, &ca->carnstat, 1, 0);
 
@@ -777,6 +989,12 @@ static int commadpt_init_handler (DEVBLK *dev, int argc, char *argv[]) {
             break;
 
          case COMMADPT_KW_ADAPTIP:
+#if defined(__GENODE__)
+            /* Parsed and not used: a device statement carried over from a
+               native run is told what is wrong rather than failing on an
+               unrecognised keyword. bus= and tag= are what matter here. */
+            break;
+#else
             if (strcmp(res.text, "*") == 0) {
                dev->commadpt->adaptip = INADDR_ANY;
                break;
@@ -787,6 +1005,7 @@ static int commadpt_init_handler (DEVBLK *dev, int argc, char *argv[]) {
                errcnt++;
             }
             break;
+#endif
 
          default:
             break;
@@ -962,8 +1181,28 @@ static void commadpt_execute_ccw (DEVBLK *dev, BYTE code, BYTE flags,
          /* BASIC SENSE                                              */
          /*----------------------------------------------------------*/
          case 0x04:
-            /* Wait for the sense data */
-            rc = recv(dev->commadpt->busfd, dev->sense, 256, 0);
+            /* Wait for the sense data -- ONE BYTE, and read exactly one.
+             *
+             * The 3705 sends a single sense byte and then, as a separate
+             * write, the one-byte channel return status. Two one-byte writes
+             * back to back on a loopback socket coalesce readily, and a read
+             * of up to 256 then takes BOTH: numsense becomes 2, the status
+             * byte is delivered as sense data, and the recv below waits
+             * forever for a byte that has already been consumed.
+             *
+             * Nothing reports that. The adapter thread is blocked, the
+             * simulator is idle, and three minutes later VTAM says
+             *     IST291I 370X N16A LOAD FAILED- LOADER FAILURE IN 370X
+             *
+             * It is a race, so it is intermittent -- and the NCP load issues
+             * exactly two SENSE commands, which is about the rate at which
+             * the load failed. Anything that slows either side hides it,
+             * which is why the load succeeded every time under a CCW trace.
+             *
+             * See i3705_chan_T2.c case 0x04: the send is send_socket(..., 1)
+             * in both arms, so one is not a guess.
+             */
+            rc = recv(dev->commadpt->busfd, dev->sense, 1, 0);
             dev->numsense = rc;
             dev->commadpt->unack_attn_count = 0;
             *more = 0;
@@ -1028,8 +1267,26 @@ static void commadpt_execute_ccw (DEVBLK *dev, BYTE code, BYTE flags,
          /* READ CCW                                                 */
          /*----------------------------------------------------------*/
          case 0x02:     /* READ */
+#if defined(__GENODE__)
+            /* Length first -- see i3705_chan_T2.c case 0x02. The device
+               sends two bytes of count and then that many bytes, so this
+               read and the status read after it are both of a known size
+               and neither can swallow the other. */
+            {
+               unsigned char lenpfx[2];
+               int want;
+               rc = ipc_read_exact( dev->commadpt->busfd, lenpfx, 2 );
+               if (rc != 2) { rc = -1; break; }
+               want = (lenpfx[0] << 8) | lenpfx[1];
+               if (want > (int)sizeof(dev->commadpt->inpbuf))
+                  want = (int)sizeof(dev->commadpt->inpbuf);
+               rc = want ? ipc_read_exact( dev->commadpt->busfd,
+                                           dev->commadpt->inpbuf, want ) : 0;
+            }
+#else
             /* Wait for the remote channel adapter data */
             rc = recv(dev->commadpt->busfd, dev->commadpt->inpbuf, count, 0);
+#endif
 
             dev->commadpt->read_ccw_count++;
             dev->commadpt->unack_attn_count = 0;
