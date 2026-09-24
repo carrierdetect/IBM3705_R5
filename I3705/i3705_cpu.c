@@ -530,6 +530,12 @@ while (reason == 0) {                          /* Loop until halted */
 //********************************************************
    if (debug_flag == OFF) {
       trace = fopen("trace.log", "w");
+#if defined(__GENODE__)
+      /* See i3705_chan_T2.c: a relative path at a read-only VFS root gives
+         NULL, and the next fprintf is a null dereference. */
+      if (trace == NULL)
+         trace = fopen("/dev/null", "w");
+#endif
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       fprintf(trace, "\r     ****** 3705 Executed instructions log file ******\n"
