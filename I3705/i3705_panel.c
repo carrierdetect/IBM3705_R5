@@ -31,6 +31,8 @@
 #include <sched.h>
 #include <signal.h>
 #include <string.h>
+
+extern volatile unsigned long tw_count[8];   /* pnl= in the telemetry */
 #include <unistd.h>
 #include <pthread.h>
 #include <ifaddrs.h>
@@ -264,6 +266,7 @@ void *PNL_thread(void *arg) {
 #if defined(__GENODE__)
       genode_pnl_publish(cp3705);                            /* to the telemetry bus              */
 #endif
+      tw_count[1]++;
       usleep(1000);                                          /* relax a bit                       */
    }  // End while(1)
 }
