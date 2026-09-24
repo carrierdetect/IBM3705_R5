@@ -46,6 +46,7 @@
  * fails the build for a facility the program does not want.
  */
 #include <sys/epoll.h>
+
 #endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -261,6 +262,30 @@ void main(int argc, char *argv[]) {
    //********************************************************************
    if (Tdbg_flag == ON) {
       T_trace = fopen("trace_Trunk.log", "w");
+#if defined(__GENODE__)
+      /*
+       * Same trap as the scanner's trace (see i3705_scan_T2.c): the path is
+       * relative, it lands at the VFS root, and a component whose root is a
+       * set of ROM nodes has nowhere to put it. fopen returns NULL and the
+       * fprintf on the very next line dereferences it. /dev/log rather than
+       * /dev/null so a scenario that asks for the trace can read it; the
+       * whole facility is off unless -d is given, so this costs one banner.
+       */
+      if (T_trace == NULL)
+         T_trace = fopen("/dev/log", "w");
+      if (T_trace == NULL)
+         T_trace = fopen("/dev/null", "w");
+      /*
+       * UNBUFFERED, or the trace is useless for the question it is
+       * usually asked. /dev/log is a buffered stream, so a trace that
+       * records only a few hundred bytes -- which is exactly what a
+       * link that is nearly silent produces -- never fills the 4K
+       * buffer and never appears at all. "No trace output" then reads
+       * as "nothing was forwarded" when it may mean "not flushed yet".
+       */
+      if (T_trace != NULL)
+         setvbuf(T_trace, NULL, _IONBF, 0);
+#endif
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       fprintf(T_trace, "     ****** Trunk line log file ******"
@@ -308,6 +333,38 @@ void main(int argc, char *argv[]) {
     } // End  if (Fdx)
 
 #endif  /* !__GENODE__ */
+
+#if defined(__GENODE__)
+extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+
+/*
+ * TRUNK IDLE REST.
+ *
+ * The relay loop below polls both directions with xlink_avail(fd, 0) -- a
+ * ZERO timeout -- and has no sleep anywhere in its body, so it is a pure
+ * busy-wait that pins a host core for the life of the run.
+ *
+ * That is not an oversight: a 10 ms poll timeout on this path killed the
+ * remote load once already (results/comm3705-trunk-mvs.txt, "a poll timeout
+ * where FIONREAD was"), so the choice looked like "spin, or pay 10 ms a
+ * character". It is a false choice. Rest ONLY once both directions have
+ * been quiet for a run of iterations, and reset the moment either carries
+ * a byte: a busy trunk never sleeps and an idle one costs nothing.
+ *
+ * MEASURED, genherc 2026-09-19, 3705a's scanner with its NCP loaded:
+ *     relay absent (TRUNK_PARTS=notrunk)   1476-1489 cycles/s
+ *     relay present                         103
+ *     a lone 3705                          1480
+ * i.e. the relay's spin, not the second 3705, is the 14x.
+ *
+ * TRUNKREST=0 in the environment restores the original flat-out spin.
+ */
+#define TRUNK_IDLE_SPINS  2000u
+#define TRUNK_REST_US      200u
+static unsigned trunk_idle = 0;
+static int      trunk_busy = 0;   /* set whenever either direction moved a byte */
+static int      trunk_rest_on = -1;   /* -1 = not yet read from env */
+#endif
 
 #if defined(__GENODE__)
    /*
@@ -405,6 +462,9 @@ void main(int argc, char *argv[]) {
 #endif  /* !__GENODE__ */
 
       if ((line1state == RDY) && (line2state == RDY)) {
+#if defined(__GENODE__)
+         trunk_busy = 0;            /* see TRUNK IDLE REST at the top */
+#endif
          //*****************************************************************************************
          // Check if there is data to be received from line 1
          // If the connection was lost, try to re-establish
@@ -452,6 +512,7 @@ void main(int argc, char *argv[]) {
 #if defined(__GENODE__)
             LINErlen = xlink_read(line1a_fd, LINE_rbuf, sizeof(LINE_rbuf));
             if (LINErlen <= 0) continue;   /* quiet, not closed */
+            trunk_busy = 1;
 #else
             LINErlen = read(line1a_fd, LINE_rbuf, sizeof(LINE_rbuf));
 #endif
@@ -521,6 +582,7 @@ void main(int argc, char *argv[]) {
 #if defined(__GENODE__)
             LINErlen = xlink_read(line2a_fd, LINE_rbuf, sizeof(LINE_rbuf));
             if (LINErlen <= 0) continue;   /* quiet, not closed */
+            trunk_busy = 1;
 #else
             LINErlen = read(line2a_fd, LINE_rbuf, sizeof(LINE_rbuf));
 #endif
@@ -547,6 +609,21 @@ void main(int argc, char *argv[]) {
             }  // End  if (LINErlen != rc
          }  // End if (pendingrcv > 0)
       }  // End if ((line1state == RDY) && (line2state == RDY))
+#if defined(__GENODE__)
+      /* See TRUNK IDLE REST at the top of this file. */
+      if (trunk_rest_on < 0) {
+         char const *e = getenv("TRUNKREST");
+         trunk_rest_on = (e && e[0] == '0') ? 0 : 1;
+      }
+      if (trunk_rest_on) {
+         if (trunk_busy) {
+            trunk_idle = 0;
+         } else if (++trunk_idle >= TRUNK_IDLE_SPINS) {
+            trunk_idle = TRUNK_IDLE_SPINS;
+            genode_pace_us(TRUNK_REST_US);
+         }
+      }
+#endif
    }  // End while (1)
    return;
 }
