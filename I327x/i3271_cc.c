@@ -196,7 +196,29 @@ int crc16(unsigned char *ptr, int count)
    CU2 Terminal2: E2 E2 C2 C2
    CU3 Terminal3: E3 E3 C3 C3
 */
-int proc_BSC(char* BSC_tbuf, uint16_t BSCtlen) {
+/*
+ * BSC_tbuf IS uint8_t HERE, AND THAT IS THE WHOLE OF A REAL BUG.
+ *
+ * It used to be `char*`, while the caller passes &BSC_tbuf[Fptr] from a
+ * `uint8_t BSC_tbuf[65536]` -- gcc warns "pointer targets ... differ in
+ * signedness" and the warning is the bug, not noise. The record test below
+ * is
+ *
+ *     if ((BSC_tbuf[BSCtlen-1] == PAD) && (BSC_tbuf[BSCtlen-4] == ETX))
+ *
+ * with PAD 0xff and ETX 0x03. Read through a SIGNED char the PAD byte is -1
+ * and can never equal 255, so the test ALWAYS failed and every data block
+ * was NAKed -- on every platform where char is signed, which includes
+ * x86 Linux. ETX passed only because 0x03 is positive either way.
+ *
+ * Measured: a complete, well-formed 1332-byte block --
+ *   CLU: BAD RECORD len=1332 last=FFFFFFFF etx_pos=03
+ * -- rejected 12 times a boot. The 0xFFFFFFFF is the sign extension.
+ *
+ * The strncmp calls below now cast: they are comparing DLC byte patterns,
+ * not text, so the signedness was never meaningful to them.
+ */
+int proc_BSC(uint8_t* BSC_tbuf, uint16_t BSCtlen) {
    uint8_t  Dbuf[BUFLEN_3270];            // Data buffer
    uint16_t BSCrlen, Dlen;
    int  i, rc, ckesc;
@@ -204,18 +226,18 @@ int proc_BSC(char* BSC_tbuf, uint16_t BSCtlen) {
 
 
    if ((BSC_tbuf[0] == SYN) && (BSC_tbuf[1] == SYN)) {
-      if (strncmp(BSC_tbuf, EOT_dlc, sizeof(EOT_dlc)) == 0)  {     // if EOT...
+      if (strncmp((char*)BSC_tbuf, EOT_dlc, sizeof(EOT_dlc)) == 0)  {     // if EOT...
          BSCrlen = 0;
          if (Tdbg_flag == ON)
             fprintf(T_trace, "%s Received EOT...\n",TimeStamp());
       }
-      if (strncmp(BSC_tbuf, NAK_dlc, sizeof(NAK_dlc)) == 0)  {     // if NAK...
+      if (strncmp((char*)BSC_tbuf, NAK_dlc, sizeof(NAK_dlc)) == 0)  {     // if NAK...
          BSCrlen = 0;
          if (Tdbg_flag == ON)
             fprintf(T_trace, "%s Received NAK...\n",TimeStamp());
       }
-      if ((strncmp(BSC_tbuf, ACK0_dlc, sizeof(ACK0_dlc)) == 0) ||  // if ACK0 or...
-         (strncmp(BSC_tbuf, ACK1_dlc, sizeof(ACK1_dlc)) == 0)) {   // if ACK1...
+      if ((strncmp((char*)BSC_tbuf, ACK0_dlc, sizeof(ACK0_dlc)) == 0) ||  // if ACK0 or...
+         (strncmp((char*)BSC_tbuf, ACK1_dlc, sizeof(ACK1_dlc)) == 0)) {   // if ACK1...
       if (Tdbg_flag == ON)
          fprintf(T_trace, "%s Received ACK0/ACK1...\n",TimeStamp());
       if (EOTreq == 1) {
@@ -229,7 +251,7 @@ int proc_BSC(char* BSC_tbuf, uint16_t BSCtlen) {
       //***********************************************************
       // Check for init transmission ENQ
       //***********************************************************
-      if (strncmp(BSC_tbuf, ENQ_dlc, sizeof(ENQ_dlc)) == 0) {      // if ENQ...
+      if (strncmp((char*)BSC_tbuf, ENQ_dlc, sizeof(ENQ_dlc)) == 0) {      // if ENQ...
          if (Tdbg_flag == ON)
             fprintf(T_trace, "%s Received Init transmission ENQ...\n",TimeStamp());
          lastACK = 1;                                              // Respond with ACK...
@@ -350,7 +372,7 @@ int proc_BSC(char* BSC_tbuf, uint16_t BSCtlen) {
      //***********************************************************
      //* ???
      //***********************************************************
-     if (strncmp(BSC_tbuf, STX_dlc, sizeof(STX_dlc)) == 0) {       // if STX...
+     if (strncmp((char*)BSC_tbuf, STX_dlc, sizeof(STX_dlc)) == 0) {       // if STX...
         if (Tdbg_flag == ON)
            fprintf(T_trace, "%s Receiving %d bytes of data...\n",TimeStamp(), BSCtlen);
         // Get Dlen by searching for x'FF'. (PAD)
@@ -395,6 +417,18 @@ int proc_BSC(char* BSC_tbuf, uint16_t BSCtlen) {
                NAKreq = 1;
             }  // End if CRCds
          } else {                                                  // Somethings wrong with the input record
+            /* VALUES, NOT A HEX DUMP. Genode's LOG truncates a message at
+               ~267 characters, which is exactly a prefix plus 65 hex
+               triplets -- so every long dump on this path was cut at 65
+               bytes, identically, in every boot and in the native reference
+               too. That artifact was mistaken for a 65-byte truncated frame
+               and cost an evening. Print the three bytes the test actually
+               reads, and the length, and nothing else. */
+            printf("\rCLU: BAD RECORD len=%d last=%02X etx_pos=%02X pre=%02X\n",
+                   (int)BSCtlen,
+                   (unsigned)BSC_tbuf[BSCtlen-1],
+                   (unsigned)BSC_tbuf[BSCtlen-4],
+                   (unsigned)BSC_tbuf[BSCtlen-5]);
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s 3270 Input Buffer: ", TimeStamp());
                for (int i = 0; i < BSCtlen; i ++) {
@@ -787,6 +821,15 @@ void main(int argc, char *argv[]) {
          printf("\rCLU: BSC line connection has been re-established\n");
       } else {
          if (pendingrcv > 0) {
+            /* One read is one or more whole frames here: the sender
+               writes a complete frame and the crosslink delivers it intact.
+               An accumulate-until-PAD loop was added on the theory that this
+               read was coming back short -- it was not, and the loop body
+               never executed once. What looked like a 65-byte truncation was
+               Genode's LOG cutting the hex dump at ~267 characters, which is
+               exactly 65 triplets after the timestamp prefix. The frame
+               scanner below is bounded regardless, so a genuinely short or
+               malformed frame cannot walk it off the end. */
             BSCtlen = read(clubsc_fd, BSC_tbuf, sizeof(BSC_tbuf));
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s 3271 Receive Buffer: ",TimeStamp());
@@ -803,7 +846,18 @@ void main(int argc, char *argv[]) {
             do {
                frame_len = 0;          // initial frame size
                // Find end of BSC frame...
+#if defined(__GENODE__)
+               /* Bounded: the unguarded form walks off the end of the bytes
+                  actually read when the buffer holds a partial frame, which
+                  is how a 65-byte read got reported as a 1332-byte frame.
+                  Upstream issue 19. Guarded so the native reference binary,
+                  which this tree also builds and which is the measurement
+                  baseline, stays byte-for-byte unchanged. */
+               while (Fptr + frame_len < BSCtlen &&
+                      !(BSC_tbuf[Fptr + frame_len + 0] == 0xFF)) {
+#else
                while (!(BSC_tbuf[Fptr + frame_len + 0] == 0xFF)) {
+#endif
                   // Check if we received two consecutive SYN characters in the text...
                   // ...these are time-fill syncs and must be removed
                   if ((frame_len > 3) && (BSC_tbuf[Fptr + frame_len] == SYN) && (BSC_tbuf[Fptr + frame_len + 1] == SYN))  {
