@@ -446,7 +446,20 @@ uint8 rc;
 
       LIBline[line]->LIBsync = 0;                                    // Reset SYNC.
       //**************************************************************
+#if defined(__GENODE__)
+      /* NOT `rc`: it is declared uint8 in this function, so a 1398-byte
+         return lands as 118. The value has always been discarded, so that
+         has never mattered -- but a diagnostic that reads it must not. */
+      {
+         int const sent_rc = send(LIBline[line]->d327x_fd, LIBline[line]->LIB_tbuf,
+                                  LIBline[line]->LIBtlen, 0);
+         if (sent_rc != (int) LIBline[line]->LIBtlen)
+            printf("\rLIB: line %d SHORT WRITE: asked %d, sent %d\n",
+                   line, (int) LIBline[line]->LIBtlen, sent_rc);
+      }
+#else
       rc = send(LIBline[line]->d327x_fd, LIBline[line]->LIB_tbuf, LIBline[line]->LIBtlen, 0); // Send frame
+#endif
       //**************************************************************
       LIBline[line]->LIBtlen = 0;                                    // Reset transmitted data length.
    }  // End if state
