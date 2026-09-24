@@ -24,6 +24,16 @@
 
 #include "sim_defs.h"
 #include "i3705_defs.h"
+#if defined(__GENODE__)
+/* Genode has no SYS_gettid and the number is only ever printed. pthread_self
+   is a pointer here, so it is cast rather than formatted as one. */
+#include <pthread.h>
+#define THREAD_ID()  ((long)(unsigned long)pthread_self())
+#else
+#include <sys/syscall.h>
+#define THREAD_ID()  syscall(SYS_gettid)
+#endif
+
 #include "i3705_Eregs.h"     // External regs defs
 #include <signal.h>
 #include <ctype.h>
@@ -34,10 +44,38 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#if defined(__GENODE__)
+
+/*
+ * On Genode the channel adapter has no sockets.
+ *
+ * Each channel is two terminal_crosslink sessions -- bus and tag -- opened
+ * from VFS paths the component config names, and genode_ca.c holds them. The
+ * pairing is the same one the TCP version made by accepting twice on one
+ * port, bus first: see ../../COMM3705.md.
+ *
+ * The three redirections below are the whole reason the body of this file is
+ * almost unchanged. send() and recv() on a crosslink fd are not sockets, and
+ * a crosslink WRITE RETURNS A SHORT COUNT rather than blocking when its ring
+ * is full, so a plain write() drops the tail of a channel message with no
+ * error anywhere. genode_ca_write() loops; genode_ca_read() returns what is
+ * there, which is the semantic read_socket() already had.
+ *
+ * Redirected rather than rewritten at each site deliberately: every call in
+ * this file that names bus_socket or tag_socket is a channel stream, and
+ * there is no other read() in it to catch by accident.
+ */
+#include "genode_ca.h"
+#define send(fd, buf, len, flags)  genode_ca_write((fd), (buf), (int)(len))
+#define recv(fd, buf, len, flags)  genode_ca_read ((fd), (buf), (int)(len))
+#define read(fd, buf, len)         genode_ca_read ((fd), (buf), (int)(len))
+#define shutdown(fd, how)          (0)
+#else
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#endif
 
 #define IMAX 4096            // Input buffer size Random. Need to define a more rational value
 #define RMAX 64              // Response buffer size Random. Need to define a more rational value
@@ -132,8 +170,10 @@ int wrkid, offset;
 int CAready = FALSE;
 
 char abswid[2] = {"AB"};
+#if !defined(__GENODE__)
 int epoll_fd;
 struct epoll_event event, events[MAXCHAN*2];
+#endif
 
 // ************************************************************
 // Function to format and display incomming data from host
@@ -178,6 +218,15 @@ void print_regs(struct IO3705 *iob, char *text) {
 // Function to check if socket is (still) connected
 // ************************************************************
 static bool IsSocketConnected(int sockfd) {
+#if defined(__GENODE__)
+   /*
+    * A crosslink is connected for as long as it is open. There is no peer to
+    * lose: both ends are children of the same init and the scenario starts
+    * them together. What the TCP version used this for -- re-arming the
+    * listener after a host went away -- has nothing left to re-arm.
+    */
+   return (sockfd >= 0) ? true : false;
+#else
    int rc;
    struct sockaddr_in *ccuptr;
    socklen_t *addrlen;
@@ -193,12 +242,30 @@ static bool IsSocketConnected(int sockfd) {
       return true;
    else
       return false;
+#endif
 }
 
 // ************************************************************
 // Function to accept TCP connection from host
 // ************************************************************
 int host_connect(struct IO3705 *iob, int abport) {
+#if defined(__GENODE__)
+   /*
+    * Nothing to accept. The two crosslinks for this channel were opened
+    * before the simulator started; taking them here is what the pair of
+    * accepts did -- bus first, then tag -- with the same result and without
+    * the ordering having to be re-established every time.
+    */
+   genode_ca_fds((unsigned)(iob->CA_id - '0'), abport,
+                 &iob->bus_socket[abport], &iob->tag_socket[abport]);
+
+   if (iob->bus_socket[abport] < 0 || iob->tag_socket[abport] < 0)
+      return -1;
+
+   printf("CA%c: bus and tag attached on channel %c\n\r",
+          iob->CA_id, abswid[abport]);
+   return 0;
+#else
    int alive = 1;     // Enable KEEP_ALIVE
    int idle = 5;      // First  probe after 5 seconds
    int intvl = 3;     // Subsequent probes after 3 seconds
@@ -256,6 +323,7 @@ int host_connect(struct IO3705 *iob, int abport) {
       }
    }
    return 0;
+#endif
 }
 
 
@@ -332,9 +400,57 @@ int read_socket(int sockptr, char *buffptr, int buffsize) {
 }
 
 // ************************************************************
+// Function to read an exact number of bytes
+// ************************************************************
+//
+// A CCW is EIGHT BYTES and read_socket takes whatever has arrived, which
+// with a fast host is the next CCW as well: two writes coalesce, the extra
+// bytes are parsed as part of this one and then lost, and the adapter waits
+// for a command that has already been thrown away. VTAM gives up three
+// minutes later with
+//
+//     IST291I 370X N16A LOAD FAILED- LOADER FAILURE IN 370X
+//
+// and the simulator says nothing, because from its side nothing went wrong.
+//
+// It is a race, so it is intermittent, and anything that slows the sender
+// hides it -- the NCP load succeeds EVERY time with a CCW trace running or
+// debug=yes on the device statement, and fails most times without. That is
+// how it was found, and it is the reason this is a whole-message read and
+// not a larger buffer.
+//
+int read_socket_n(int sockptr, char *buffptr, int want) {
+   int got = 0;
+
+   while (got < want) {
+      int rc = read(sockptr, buffptr + got, want - got);
+      if (rc <= 0) {
+         printf("CA: short read, wanted %d got %d\n\r", want, got);
+         return rc;
+      }
+      got += rc;
+   }
+   return got;
+}
+
+// ************************************************************
 // Function to close TCP socket
 // ************************************************************
 int close_socket(struct IO3705 *iob, int abchannel) {
+#if defined(__GENODE__)
+   /*
+    * Deliberately nothing.
+    *
+    * A crosslink is not closed and reopened when a channel goes quiet: there
+    * is no listener to re-arm and no second peer that could take its place,
+    * and closing would only lose the descriptor genode_ca.c is holding. The
+    * A/B switch, which is the only caller that reaches this in practice, is
+    * a configuration setting here rather than a panel control -- see
+    * ../../COMM3705.md on what the panel gives up.
+    */
+   (void)iob; (void)abchannel;
+   return 0;
+#else
 
    /* First shutdown the sockets to terminate active blocked reads */
    /* The BUS and TAG sockets are closed by the active CA1/2 thread */
@@ -352,6 +468,7 @@ int close_socket(struct IO3705 *iob, int abchannel) {
       printf("CA%c: Channel connection %c closed\n\r", iob->CA_id, abswid[abchannel]);
    }
    return 0;
+#endif
 }
 
 // ************************************************************
@@ -372,6 +489,24 @@ int send_socket(int sockptr, char *respp, int respsize) {
 // Function to enable the A or B port of a CA.
 // ***********************************************************
 void start_listen(struct IO3705 *iob, int abport) {
+#if defined(__GENODE__)
+   /*
+    * There is no listener. The crosslinks are already open, so all this does
+    * is say which channel is live -- which is what the message it replaces
+    * said, minus the port number.
+    */
+   int bus, tag;
+
+   genode_ca_fds((unsigned)(iob->CA_id - '0'), abport, &bus, &tag);
+
+   if (bus < 0 || tag < 0) {
+      printf("CA%c: channel %c is not configured\n\r",
+             iob->CA_id, abswid[abport]);
+      return;
+   }
+   printf("CA%c: waiting for the channel on %c (bus fd %d, tag fd %d)\n\r",
+          iob->CA_id, abswid[abport], bus, tag);
+#else
 
    int flag = 1;
 
@@ -407,6 +542,7 @@ void start_listen(struct IO3705 *iob, int abport) {
    }
    // Now server is ready to listen
    printf("CA%c: Waiting for channel connection on TCP port %d \n\r", iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport] );
+#endif
 }
 
 // ************************************************************
@@ -509,13 +645,29 @@ void *CA_T2_thread(void *arg) {
       uint64_t u64;
    } epoll_Data_t;
 
-   printf("CA-T2: Main thread %ld started succesfully...\n\r", syscall(SYS_gettid));
+   printf("CA-T2: Main thread %ld started succesfully...\n\r", THREAD_ID());
 
    // ********************************************************************
    // Channel Adapter debug trace facility
    // ********************************************************************
    if (Adbg_flag == OFF) {
       A_trace = fopen("trace_A.log", "w");
+#if defined(__GENODE__)
+      /*
+       * The trace files are relative paths, so they land at the VFS root,
+       * and a component whose root is a set of ROM nodes has nowhere to
+       * put them. fopen then returns NULL and the very next line is an
+       * unguarded fprintf to it -- which is an "illegal READ at address
+       * 0xa0" from whichever thread got there first, and says nothing
+       * about a log file.
+       *
+       * /dev/null keeps every fprintf in this file valid without guarding
+       * each one. A scenario that wants the traces mounts something
+       * writable at the root and gets them at the upstream path.
+       */
+      if (A_trace == NULL)
+         A_trace = fopen("/dev/null", "w");
+#endif
       fprintf(A_trace, "     ****** 3705 CHANNEL ADAPTER log file ****** \n\n"
                        "                   01 - trace CCW activity \n"
                        );
@@ -541,11 +693,13 @@ void *CA_T2_thread(void *arg) {
       iobs[i]->chainbl = 0;                // Initial chain data buffer length=0
    }
 
+#if !defined(__GENODE__)
    epoll_fd = epoll_create(10);
    if (epoll_fd == -1) {
       printf("CA_T2: failed to created epoll file descriptor\r\n");
       return 0;
    }
+#endif
 
    rc = pthread_create(&id1, NULL, CAx_thread, NULL);
    if (rc  != 0) {
@@ -555,6 +709,114 @@ void *CA_T2_thread(void *arg) {
 
    CAready = TRUE;                         // Channel Adapter(s) ready to go
 
+#if defined(__GENODE__)
+   /*
+    * The same loop, with the polling taken out of it.
+    *
+    * Upstream this waits on epoll for a connection to a listening socket,
+    * accepts twice, and reads the two-byte device address the host sends on
+    * the bus. Here the crosslinks are already open, so only the last of those
+    * three is left -- and it is kept exactly, because it is the handshake
+    * that tells the 3705 which device it is:
+    *
+    *    CA1: Connected to device 0660
+    *
+    * Blocking on that read is safe and is the point. A crosslink buffers, so
+    * a Hercules that starts first has already left its two bytes waiting; a
+    * Hercules that starts second finds this thread asleep here. Neither
+    * ordering needs a retry loop, which is what the TCP version spent its
+    * connect() and accept() polling on.
+    */
+   /*
+    * EVERY CONFIGURED CHANNEL IS SET UP FIRST, AND THEN THEY ARE POLLED
+    * TOGETHER. One 3705 serving two hosts must not let either of them hold
+    * the other's channel down.
+    *
+    * This loop used to handshake channel by channel: set up CA1, block until
+    * ITS host sent the two device-address bytes, then do the same for CA2.
+    * With one host that is indistinguishable from what is here. With two it
+    * means a partition that is slow to start, or does not start at all,
+    * keeps the OTHER partition's adapter from ever attaching -- and what
+    * that looks like from the second host is a channel that never answers,
+    * with the only clue five thousand miles away in a message about the
+    * first one.
+    *
+    * So the waits are interleaved. Whichever host speaks first is taken
+    * first, the other is still waited for, and neither can starve the other.
+    */
+   {
+      int waiting[MAXCHAN];
+      int pending = 0;
+
+      for (int j = 0; j < MAXCHAN; j++) {
+         waiting[j] = 0;
+
+         if (iobs[j]->abswitch == -1)          // both A and B disabled
+            continue;
+
+         start_listen(iobs[j], iobs[j]->abswitch);
+
+         if (host_connect(iobs[j], iobs[j]->abswitch) != 0)
+            continue;
+
+         waiting[j] = 1;
+         pending++;
+      }
+
+      /*
+       * Polled rather than a blocking read, and deliberately so.
+       *
+       * This is the only read in the simulator that happens before the host
+       * is necessarily there, and it is the one whose silence is hardest to
+       * read: nothing else is printed between here and the channel going
+       * live. The message every five seconds is the difference between "the
+       * emulator has not started yet" and "something is wrong", and it names
+       * the channel because with two of them "waiting" is ambiguous.
+       *
+       * genode_ca_avail blocks for its timeout, so one pass costs 100 ms per
+       * channel still waiting and the tick below counts passes rather than
+       * time. See genode_ca.h on why the timeout cannot be zero.
+       */
+      for (int waited = 0; pending > 0; waited++) {
+         for (int j = 0; j < MAXCHAN; j++) {
+            if (!waiting[j])
+               continue;
+
+            if (!genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 100))
+               continue;
+
+            rc = genode_ca_read_exact(iobs[j]->bus_socket[iobs[j]->abswitch],
+                                      iobs[j]->buffer, 2);
+            waiting[j] = 0;
+            pending--;
+
+            if (rc < 2) {
+               printf("CA%c: no device address from the host\n\r", iobs[j]->CA_id);
+               continue;
+            }
+            iobs[j]->devnum = (iobs[j]->buffer[0] << 8) | iobs[j]->buffer[1];
+            printf("CA%c: Connected to device %04X\n\r",
+                   iobs[j]->CA_id, iobs[j]->devnum);
+            iobs[j]->CA_active = TRUE;
+         }
+
+         if (pending > 0 && waited > 0 && waited % 50 == 0)
+            for (int j = 0; j < MAXCHAN; j++)
+               if (waiting[j])
+                  printf("CA%c: waiting for the host to claim the channel\n\r",
+                         iobs[j]->CA_id);
+      }
+   }
+
+   /*
+    * Nothing left to watch. The A/B switch is a configuration setting rather
+    * than a panel control here, so it cannot be thrown while the 3705 runs,
+    * and there is no listener to re-arm.
+    */
+   while (1)
+      sleep(5);
+
+#else
    while(1) {
       // check if the A/B switch has been thrown
       for (int i = 0; i < MAXCHAN; i++) {
@@ -598,8 +860,8 @@ void *CA_T2_thread(void *arg) {
                      rc = host_connect(iobs[j], k);
                      if (rc == 0) {
                         // Get device number
-                        rc = read_socket(iobs[j]->bus_socket[iobs[j]->abswitch], iobs[j]->buffer, sizeof(iobs[j]->buffer));
-                        if (rc != 0) {
+                        rc = read_socket_n(iobs[j]->bus_socket[iobs[j]->abswitch], (char *)iobs[j]->buffer, 2);
+                        if (rc == 2) {
                            iobs[j]->devnum = (iobs[j]->buffer[0] << 8) | iobs[j]->buffer[1];
                            printf("CA%c: Connected to device %04X\n\r", iobs[j]->CA_id, iobs[j]->devnum);
                            // Change the CA status to active
@@ -618,10 +880,14 @@ void *CA_T2_thread(void *arg) {
       }  // End for event_count
    }  // End While(1)
 
+#endif
+
+#if !defined(__GENODE__)
    if (close(epoll_fd)) {
       printf("CA_T2: failed to close epoll file descriptor\n\r");
       return 0;
    }
+#endif
    return 0 ;
 }
 
@@ -668,7 +934,15 @@ void *CAx_thread(void *arg) {
             }
             if (iobs[j]->CA_active == TRUE) {
                pendingrcv = 0;
+#if defined(__GENODE__)
+               /* 10 ms, not 0. A zero-timeout poll on a VFS terminal asks
+                  whether a buffer is full without letting the signal handler
+                  that fills it run: the channel then never sees a CCW, and
+                  MVS halts the I/O it issued at IPL. See genode_ca.h. */
+               pendingrcv = genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 10);
+#else
                ioctl(iobs[j]->bus_socket[iobs[j]->abswitch], FIONREAD, &pendingrcv);
+#endif
                if (pendingrcv > 0) {
                   exec_ccw(iobs[j]);
                } // End if pendingrcv
@@ -705,9 +979,39 @@ void exec_ccw(struct IO3705 *iob) {
       return;
    }
 
-   rc = read_socket( iob->bus_socket[iob->abswitch], iob->buffer, sizeof(iob->buffer));
+#if defined(__GENODE__)
+   /*
+    * Yield, once per CCW.
+    *
+    * This is not superstition and it is not a sleep to paper over a race: a
+    * version of this file that printed one line per CCW ran the NCP to
+    * IST093I every time, and the identical build with the print removed
+    * stalls after the load. The print was doing one LOG round trip per
+    * channel program, and that round trip was the only thing letting the
+    * other threads in this component run at the right moment.
+    *
+    * So the yield is made explicit rather than left as a side effect of
+    * tracing, and there is no dependence on a printf that a later reader
+    * would quite reasonably delete.
+    *
+    * IT HAS TO BE usleep(1) AND NOT usleep(0). Genode's nanosleep takes
+    * POSIX at its word -- "nanosleep({0,0}) may yield but is not required
+    * to" -- and returns without entering the libc monitor at all
+    * (repos/libports/src/lib/libc/sleep.cc:52). usleep(0) is therefore not
+    * a scheduling point on this platform; it is nothing. It was written
+    * here as the replacement for the printf and it replaced it with a
+    * no-op, which is the worst of both: the trace was gone and so was the
+    * only thing the trace was doing.
+    *
+    * usleep(1) rounds UP to the 1 ms floor the same file applies, which is
+    * a real suspension and a real scheduling point. The cost is one
+    * millisecond per CCW and an NCP load is 364 of them.
+    */
+   usleep(1);
+#endif
+   rc = read_socket_n( iob->bus_socket[iob->abswitch], (char *)iob->buffer, 8);
 
-   if (rc == 0) {
+   if (rc <= 0) {
       // Host disconnected, get details and print it
       printf("CA%c: Error reading CCW, closing channel connection\n\r", iob->CA_id);
       // Change the CA status to inactive
@@ -829,7 +1133,40 @@ void exec_ccw(struct IO3705 *iob) {
                   wait();                                // Wait for initial selection reset
             }
 
+#if defined(__GENODE__)
+            /*
+             * LENGTH FIRST. The host asked for ccw.count bytes and the
+             * device is sending wdcnttot of them, which is usually fewer,
+             * and the one-byte channel status follows as a separate write.
+             * The host cannot tell where the data ends: its read is bounded
+             * by the COUNT, so when the two writes coalesce it takes the
+             * status byte as the last byte of data and then waits forever
+             * for a status that is already gone.
+             *
+             * TCP hides this because two writes usually arrive apart. A
+             * crosslink is a ring behind one entrypoint and they almost
+             * always arrive together, so what is intermittent upstream is
+             * reliable here: the NCP loads (IST270I) and its first READ
+             * never completes.
+             *
+             *     IGF991I  DEVICE AND CHANNEL END PENDING FOR DEVICE 660
+             *
+             * Two bytes of length, big-endian, then the data. Every read on
+             * this path is then of a known size. It is a wire change between
+             * these two components and nothing else speaks this protocol.
+             * comm3705.c has the other half.
+             */
+            {
+               unsigned char lenpfx[2];
+               lenpfx[0] = (unsigned char)((wdcnttot >> 8) & 0xFF);
+               lenpfx[1] = (unsigned char)( wdcnttot       & 0xFF);
+               rc = send(iob->bus_socket[iob->abswitch], (void*)lenpfx, 2, 0);
+               if (rc > 0)
+                  rc = send(iob->bus_socket[iob->abswitch], (void*)&iob->buffer, wdcnttot, 0);
+            }
+#else
             rc = send(iob->bus_socket[iob->abswitch], (void*)&iob->buffer, wdcnttot, 0);
+#endif
 
             // Send CA return status to host
             if (condition != 3) {
@@ -914,11 +1251,25 @@ void exec_ccw(struct IO3705 *iob) {
                 wait();                                  // Wait for CA1 L3 Request reset
             print_regs(iob, "CCW 05, 09, 01 Pre");
 
-            // Read data from host, but first make sure host has finished writing all data to the TCP buffer
-            pendingrcv = 0;
-            while (pendingrcv != ccw.count)
-               ioctl(iob->bus_socket[iob->abswitch], FIONREAD, &pendingrcv);
-            rc = recv( iob->bus_socket[iob->abswitch], iob->chainbuf + iob->chainbl, sizeof(iob->chainbuf)-iob->chainbl, 0);
+            // Read data from host. EXACTLY ccw.count bytes of it.
+            //
+            // This read the whole of the remaining buffer, and upstream
+            // spun on FIONREAD first to make that safe -- which it is not:
+            // with command chaining the NEXT CCW is already in the socket,
+            // so the read swallows it and the adapter then waits for a
+            // command that is sitting in chainbuf being treated as data.
+            // See read_socket_n. Same failure, same three-minute silence:
+            //     IST291I 370X N16A LOAD FAILED- LOADER FAILURE IN 370X
+            //
+            // Reading the known length needs no spin, so the spin is gone
+            // with it, and Genode needs no branch of its own here any more.
+            {
+               int want = ccw.count;
+               int room = (int)(sizeof(iob->chainbuf) - iob->chainbl);
+               if (want > room) want = room;
+               rc = read_socket_n(iob->bus_socket[iob->abswitch],
+                                  (char *)(iob->chainbuf + iob->chainbl), want);
+            }
             if ((Adbg_flag == ON) && (Adbg_reg & 0x01))  // Trace channel adapter activities ?
                fprintf(A_trace, "CA%c: received: %d bytes from host\n\r", iob->CA_id, rc);
             iob->bufferl = rc;
@@ -1088,6 +1439,13 @@ void exec_ccw(struct IO3705 *iob) {
             break;
 
          default:       // Send command reject sense
+            // SAY SO. This fires ZERO times in an NCP load -- 31/51/32/52
+            // and the rest are SDLC link commands with cases of their own --
+            // so a reject during one means the adapter is reading data as a
+            // command, which is the failure mode three separate bugs in this
+            // file have already produced. Silence here cost an afternoon.
+            printf("CA%c: command reject, CCW %02X count %d flags %02X\n\r",
+                   iob->CA_id, ccw.code, ccw.count, ccw.flags);
             //iob->buffer[0] = SENSE_CR;                  // Load sense data byte 0
             //if (debug_reg & 0x80)
             //   printf("CA%c: Sending sense Byte 0 %02X \n\r", iob->CA_id, iob->buffer[0]);
