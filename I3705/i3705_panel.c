@@ -288,7 +288,23 @@ void timer_msec (long int msec) {
 // Kick the 3705 100msec timer...
 void sig_handler (int signo) {
    float millis = 0.0;
-   if ((test_mode == OFF) && !(Eregs_Inp[0x7F] &= 0x0004)) {
+   /*
+    * "&" HERE, NOT "&=".  This is the 100 ms interval timer's handler and the
+    * test is meant to read "if the timer request bit is not already set".
+    * With "&=" it ASSIGNS: every tick masked Eregs_Inp[0x7F] down to bit
+    * 0x0004 and threw away every other pending indication in it --
+    *
+    *    0x8000 diagnostic L2      0x0200 panel interrupt
+    *    0x0100 PCI L4             0x0002 PCI L3        0x0001 SVC L4
+    *
+    * -- ten times a second, for the life of the run.  That it is a typo and
+    * not a deliberate clear is plain from i3705_cpu.c, which rebuilds this
+    * register with "Eregs_Inp[0x7F] &= 0x0204;" and takes care to PRESERVE
+    * the panel and timer bits while it does so.
+    *
+    * Correctness only: measured, it does not change the remote load time.
+    */
+   if ((test_mode == OFF) && !(Eregs_Inp[0x7F] & 0x0004)) {
       pthread_mutex_lock(&r7f_lock);
       Eregs_Inp[0x7F] |= 0x0004;
       pthread_mutex_unlock(&r7f_lock);
