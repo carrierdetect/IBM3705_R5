@@ -38,6 +38,16 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include "i3705_defs.h"
+#if defined(__GENODE__)
+/* Genode has no SYS_gettid and the number is only ever printed. pthread_self
+   is a pointer here, so it is cast rather than formatted as one. */
+#include <pthread.h>
+#define THREAD_ID()  ((long)(unsigned long)pthread_self())
+#else
+#include <sys/syscall.h>
+#define THREAD_ID()  syscall(SYS_gettid)
+#endif
+
 #include "i3705_Eregs.h"               /* Exernal regs defs */
 
 
@@ -62,6 +72,10 @@ int rc, i;
 
 #define SHMEM_ID "/SHM_PANEL"
 
+#if defined(__GENODE__)
+#include "genode_pnl.h"
+#endif
+
 struct CP3705 *cp3705;
 
 
@@ -80,7 +94,7 @@ extern void wait();
    signature: it has one void* parameter and returns void    */
 
 void *PNL_thread(void *arg) {
-   fprintf(stderr, "PNL: Thread %ld started succesfully... \n\r", syscall(SYS_gettid));
+   fprintf(stderr, "PNL: Thread %ld started succesfully... \n\r", THREAD_ID());
 
    // We can set one or more bits here, each one representing a single CPU
    //cpu_set_t cpuset;
@@ -100,6 +114,25 @@ void *PNL_thread(void *arg) {
    //sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
 
+#if defined(__GENODE__)
+   /*
+    * No signal, and no shared memory.
+    *
+    * The interval timer is a thread rather than SIGALRM because Genode's
+    * setitimer does not honour it_interval -- see genode_pnl.h; a faithful
+    * port of the signal version would tick once and the 3705 would silently
+    * lose its 100 ms timer.
+    *
+    * The state block is this component's own memory rather than a POSIX
+    * shared-memory object, because the second process that mapped it is not
+    * here: the panel is published to the telemetry bus instead. Everything
+    * the loop below does to cp3705 is unchanged -- what differs is only who
+    * reads it, and that the inputs (the Load key, the A/B switches) now come
+    * from the SIMH configuration rather than from an xterm.
+    */
+   genode_pnl_timer_start(sig_handler);
+   cp3705 = genode_pnl_block();
+#else
    signal (SIGALRM, sig_handler);      // Interval timer //
    timer_msec(100);                    // <=== sets the 3705 interval timer
 
@@ -126,6 +159,7 @@ void *PNL_thread(void *arg) {
       printf("\nPNL: Failed to map memory to address space\r");;
       exit(-1);
    }
+#endif
 
    while (CAready != TRUE)                                   /* Wait until channel IO blocks have been initialized */
       usleep(100);
@@ -134,8 +168,19 @@ void *PNL_thread(void *arg) {
       cp3705->reg71_Out = Eregs_Out[0x71];                     /* Get display register A      */
       cp3705->reg72_Out = Eregs_Out[0x72];                     /* Get display register B      */
       cp3705->reg7A_In =  Eregs_Inp[0x7A];
-      memcpy(cp3705->CA1_bus_socket,iobs[0]->bus_socket,2);    /* Get CA1 file descriptor */
-      memcpy(cp3705->CA2_bus_socket,iobs[1]->bus_socket,2);    /* Get CA file descriptor */
+      /* sizeof, not 2. bus_socket is int[2] and so are these, so a length of
+         2 copies two BYTES: half of the A channel's descriptor on a
+         little-endian host and none of the B channel's at all, which then
+         reads as descriptor 0 -- stdin -- and shows on the panel as a B
+         channel attached when it is not. Unguarded: it is wrong everywhere,
+         and the panel is the one place a person looks to find out which
+         channel is live. */
+      memcpy(cp3705->CA1_bus_socket,iobs[0]->bus_socket,sizeof(cp3705->CA1_bus_socket));
+      memcpy(cp3705->CA2_bus_socket,iobs[1]->bus_socket,sizeof(cp3705->CA2_bus_socket));
+#if defined(__GENODE__)
+      for (int i = 0; i < MAXCHAN; i++)
+         cp3705->CA_claimed[i] = iobs[i]->CA_active;    /* host has claimed it */
+#endif
       for (int i = 0; i < MAXCHAN; i++) {
          if (cp3705->ABswitch[i] != iobs[i]->abswitch)         /* If CAx switch position changed on Control Panel */
            iobs[i]->abswitch = cp3705->ABswitch[i];            /* Update  CAx                                     */
@@ -216,6 +261,9 @@ void *PNL_thread(void *arg) {
             cp3705->pnlkey = NOKEY;                          /* Reset key pressed                 */
             break;
       } // End switch (cp3705->pnlkey)
+#if defined(__GENODE__)
+      genode_pnl_publish(cp3705);                            /* to the telemetry bus              */
+#endif
       usleep(1000);                                          /* relax a bit                       */
    }  // End while(1)
 }

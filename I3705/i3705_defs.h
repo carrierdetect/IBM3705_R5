@@ -139,6 +139,22 @@ struct CP3705 {
    uint32_t reg7F_In;
    uint32_t reg71_Out;
    uint32_t reg72_Out;
+#if defined(__GENODE__)
+   /*
+    * Whether each adapter's host has CLAIMED the channel, which is not the
+    * same as whether a socket exists for it. The panel is where a person
+    * looks to find out which channel is live, and on the Genode port every
+    * configured channel has an open descriptor from the moment the component
+    * starts -- the crosslinks are opened before the simulator runs -- so a
+    * descriptor says 'cabled', not 'connected'.
+    *
+    * Guarded and at the END of the structure because upstream this block is
+    * a POSIX shared-memory object that a separate ncurses process maps, and
+    * both halves must agree on its layout. Here there is no second process:
+    * the panel is published to the telemetry bus. See genode_pnl.h.
+    */
+   int CA_claimed[MAXCHAN];
+#endif
 };
 /* RS232 signals. The 4 high order bit positions are alinged with the scanner Display Register   */
 #define CTS 0x80   /* Clear To Send                 */
