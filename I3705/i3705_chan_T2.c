@@ -782,9 +782,59 @@ void *CA_T2_thread(void *arg) {
        * time. See genode_ca.h on why the timeout cannot be zero.
        */
       for (int waited = 0; pending > 0; waited++) {
+#if defined(__GENODE__)
+         /*
+          * BACK OFF ONCE IT IS CLEAR NO HOST IS COMING.
+          *
+          * genode_ca_avail blocks for its whole timeout, and a blocking VFS
+          * wait holds the component entrypoint -- which throttles every
+          * TIMED thread in the same component to about 12 ms. On a 3705
+          * whose channel is never claimed (the far end of a trunk: N17B has
+          * no channel adapter and only gets a crosslink pair because the
+          * simulator insists on one) this loop never ends, so the 12 ms is
+          * permanent and it lands on the SCANNER -- the thread that has to
+          * receive the remote load.
+          *
+          * Measured: 3705b asks its Timer for 500 us per scanner cycle and
+          * waits 11.6 ms, against 607 us on the 3705 whose channel IS
+          * claimed. Insensitive to CPU count and to every other change
+          * tried, because it is not contention -- it is this poll.
+          *
+          * After five seconds of waiting, keep the message and the polling
+          * but stop doing it back-to-back: 100 ms of poll per second leaves
+          * the entrypoint free for the other 900.
+          */
+         if (waited > 50)
+            usleep(900000);
+#endif
          for (int j = 0; j < MAXCHAN; j++) {
             if (!waiting[j])
                continue;
+
+            /*
+             * STOP WAITING ONCE THE MACHINE IS DECLARED CAdisable.
+             *
+             * The guard above this loop already says a channel with both
+             * switches off is not waited on -- but abswitch is 0 when the
+             * adapter starts and only becomes -1 when cpu_reset applies
+             * CAdisable and the panel copies it across, which happens
+             * AFTER this loop has been entered. So a remote 3705, whose
+             * channel no host will ever claim, waits here for the life of
+             * the run and polls every 100 ms.
+             *
+             * That is not free: a poll with a timeout is dispatched by the
+             * component entrypoint, and on the far 3705 of a trunk EVERY
+             * timed wait in the component then runs about 13x late --
+             * usleep(1000) measured at 24 ms against 1.8 ms on the 3705
+             * whose channel IS claimed. The scanner is one of those timed
+             * threads and it is what receives the remote load.
+             */
+            if (iobs[j]->abswitch == -1) {
+               printf("CA%c: disabled, no host expected\n\r", iobs[j]->CA_id);
+               waiting[j] = 0;
+               pending--;
+               continue;
+            }
 
             tw_count[4]++;
             if (!genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 100))
@@ -920,6 +970,9 @@ void *CAx_thread(void *arg) {
 
    while(1) {
       // We do this for ever and ever...
+#if defined(__GENODE__)
+      int did_work = 0;      /* see the rest at the end of this loop */
+#endif
       /***************************************************************/
       /*  Read channel command from host                             */
       /*                                                             */
@@ -945,6 +998,7 @@ void *CAx_thread(void *arg) {
                   that fills it run: the channel then never sees a CCW, and
                   MVS halts the I/O it issued at IPL. See genode_ca.h. */
                tw_count[3]++;
+               did_work = 1;   /* the 10 ms poll below paces the loop */
                pendingrcv = genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 10);
 #else
                ioctl(iobs[j]->bus_socket[iobs[j]->abswitch], FIONREAD, &pendingrcv);
@@ -955,6 +1009,30 @@ void *CAx_thread(void *arg) {
             }  // End if iobs[j]
          }  // End if (iobs[j]->abswitch != -1)
       }  // End for int j
+#if defined(__GENODE__)
+      /*
+       * REST IF NOTHING IN THIS PASS COULD DO ANYTHING.
+       *
+       * This while(1) has no sleep of its own: it is paced by the 10 ms
+       * genode_ca_avail above, and that call is reached ONLY when a
+       * channel is both enabled and active. A remote 3705 has neither --
+       * CAdisable sets every abswitch to -1 -- so the whole body is
+       * skipped and the loop spins flat out, past both counters, for the
+       * life of the run. ca10=0 and ca100=0 on that machine never meant
+       * "quiet", they meant "never reached".
+       *
+       * One spinning thread takes EVERY timed wait in its component from
+       * about 800 us to about 10.4 ms (port/genode/sleeptest.run), and on
+       * the far 3705 of a trunk that lands on the scanner -- the thread
+       * that has to receive the remote load. Measured there as a 500 us
+       * request taking 12 ms, against 0.85 ms on the near 3705.
+       *
+       * The local 3705 spins here too, before Hercules claims the
+       * channel: CA_active is FALSE until then.
+       */
+      if (!did_work)
+         usleep(1000);
+#endif
    }  // End of while(1)... */
 }
 
