@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <ctype.h>
 #include <pthread.h>
 #include <string.h>
@@ -45,7 +46,19 @@
 #include "i327x_327x.h"
 #include "i327x_sdlc.h"
 #include <errno.h>
+#if defined(__GENODE__)
+/*
+ * No epoll, and no need for one. Genode's libc has poll(); epoll is used
+ * here in exactly one place -- waiting for a TN3270 client to connect to a
+ * listening socket -- and poll() on that one descriptor says the same thing.
+ * See the accept loop below.
+ */
+#include <poll.h>
+#include "genode_line.h"
+#include "genode_xlink.h"
+#else
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -68,7 +81,9 @@ FILE *T_trace;                      /* Terminal trace file fd */
 struct sockaddr_in servaddr;
 struct sockaddr_in servaddr2;       /* For Full Duplex Line             */
 struct sockaddr_in sin1, *sin2;
+#if !defined(__GENODE__)
 struct epoll_event event, events[MAXSNAPU*2];
+#endif
 struct ifaddrs *nwaddr, *ifa;       /* interface address structure       */
 in_addr_t  lineip;                  /* SDLC line listening address       */
 uint16_t   lineport;                /* SDLC line listening port          */
@@ -630,7 +645,35 @@ int proc_PIU (unsigned char BLU_req_buf[], int BLU_req_len, unsigned char BLU_rs
             RU_req_len = i;
          }  // End if THRH type = DATA_MIDDLE || THRH_type = DATA_LAST
 
-         if ((THRH_type == DATA_ONLY) || (THRH_type == DATA_LAST)) {   // only or last seg ?
+         if ((THRH_type == DATA_ONLY) || (THRH_type == DATA_LAST)) {
+            /*
+             * DOUBLE THE IACs IN THE DATA FIRST, and only then append the
+             * IAC EOR that terminates the record.
+             *
+             * This is telnet BINARY: a literal 0xFF in the 3270 data stream
+             * has to go out as 0xFF 0xFF or the client's telnet layer eats it
+             * as an IAC. double_up_iac() is declared in this file and defined
+             * in i327x_3270.c, and was never called from anywhere.
+             *
+             * Nothing noticed until TSO asked the terminal what it can do.
+             * A Read Partition Query carries 0xFF as the partition id:
+             *
+             *     F3 00 05 01 FF 02 FF EF
+             *
+             * and s3270 answers that with
+             *
+             *     WriteStructuredField error: field length 5 exceeds
+             *     remaining message length 4
+             *
+             * -- the FF was consumed as an IAC, the structured field is a
+             * byte short, the client sends no Query Reply, and TSO waits for
+             * one forever. That is the whole of "the session binds and no
+             * screen ever appears".
+             *
+             * The terminator is appended AFTER, because those two bytes are
+             * meant to be a real IAC and must not be doubled.
+             */
+            RU_req_len = double_up_iac((BYTE *) Dbuf, RU_req_len);
             Dbuf[RU_req_len++] = IAC;
             Dbuf[RU_req_len++] = EOR_MARK;
          }
@@ -957,6 +1000,20 @@ int proc_PU2iml() {
       pu2[j]->seq_Ns = 0;    /* Intitialize sequence send number    */
    } // End for j = 0
 
+#if defined(__GENODE__)
+   /*
+    * THERE IS NOTHING TO CHOOSE BETWEEN. Upstream walks the host's
+    * interfaces and picks the first that is not loopback, because a machine
+    * has several and a 3274 must not bind to the wrong one. This component
+    * has exactly one interface -- the one nic_router gives it -- and lwIP
+    * has no getifaddrs at all, so binding to INADDR_ANY is both the only
+    * thing available and the right answer: which address the 3270 listener
+    * is reachable at is decided by the run script's tcp-forward, which is
+    * where Genode already expresses it.
+    */
+   ipaddr = NULL;
+   printf("\nPU2: listening on every address this component has, for 3270 connections\n");
+#else
    getifaddrs(&nwaddr);      /* get network address */
    for (ifa = nwaddr; ifa != NULL; ifa = ifa->ifa_next) {
        if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, "lo")) {
@@ -966,6 +1023,7 @@ int proc_PU2iml() {
        }
    } // End   for ifa = nwaddr
    printf("\nPU2: Using network Address %s on %s for 3270 connections\n", ipaddr, ifa->ifa_name);
+#endif
 
    for (BYTE j = 0; j < MAXSNAPU; j++) {
       if ((pu2[j]->pu_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1)
@@ -976,7 +1034,11 @@ int proc_PU2iml() {
       setsockopt(pu2[j]->pu_fd, SOL_SOCKET, SO_REUSEADDR, (void*)&sockopt, sizeof(sockopt));
       /* Bind the socket */
       sin1.sin_family=AF_INET;
+#if defined(__GENODE__)
+      sin1.sin_addr.s_addr = htonl(INADDR_ANY);
+#else
       sin1.sin_addr.s_addr = inet_addr(ipaddr);
+#endif
       sin1.sin_port=htons(32741+j);
       if (bind(pu2[j]->pu_fd, (struct sockaddr *)&sin1, sizeof(sin1)) < 0) {
           printf("\nPU2: Bind 3274-%01X socket failed\n\r", j);
@@ -989,6 +1051,7 @@ int proc_PU2iml() {
           free(pu2[j]);
           return -2;
       }
+#if !defined(__GENODE__)
       // Add polling events for the port
       pu2[j]->epoll_fd = epoll_create(1);
       if (pu2[j]->epoll_fd == -1) {
@@ -1004,6 +1067,7 @@ int proc_PU2iml() {
          free(pu2[j]);
          return -4;
       }
+#endif
       printf("\rPU2: 3274-%01X IML ready. TN3270 can connect to port %d \n\r", j,32741+j);
    }  // End for j=0
    return 0;
@@ -1020,11 +1084,44 @@ int proc_3270 () {
    // Next, check all active connection for input data.
    //
       for (BYTE k = 0; k < MAXSNAPU; k++) {
+#if defined(__GENODE__)
+         /*
+          * poll(), and the same 50 ms. epoll here watches exactly ONE
+          * descriptor -- this PU's listening socket -- so the whole of what
+          * it is being asked is "has a TN3270 client turned up", and poll on
+          * that one descriptor answers it. event_count is then 0 or 1 and
+          * the accept below is unchanged.
+          */
+         {
+            struct pollfd pfd;
+            pfd.fd      = pu2[k]->pu_fd;
+            pfd.events  = POLLIN;
+            pfd.revents = 0;
+            event_count = (poll(&pfd, 1, 50) > 0 && (pfd.revents & POLLIN)) ? 1 : 0;
+         }
+#else
          event_count = epoll_wait(pu2[k]->epoll_fd, events, MAXLU, 50);
+#endif
          for (int i = 0; i < event_count; i++) {
             if (pu2[k]->lunum != 0xFF) {                                   /* if available LU pool not exhausted      */
                //pu2[k]->readylu[pu2[k]->lunum] = 0;                         /* Indicate LU is not yet ready for action */
                pu2[k]->lu_fd[pu2[k]->lunum]=accept(pu2[k]->pu_fd, NULL, 0);  /* accept connection request               */
+#if defined(__GENODE__)
+               /*
+                * O_NONBLOCK ON THE SOCKET, NOT MSG_DONTWAIT ON THE CALL.
+                * This lwIP plugin does not honour the per-call flag: a
+                * recv(..., MSG_DONTWAIT) on a readable-but-empty socket
+                * returns 0, which is indistinguishable from a closed peer
+                * and cost a TN3270 client on every connect. With the fd
+                * itself non-blocking, a plain read() answers properly --
+                * -1/EAGAIN empty, 0 closed, >0 data.
+                */
+               if (pu2[k]->lu_fd[pu2[k]->lunum] > 0) {
+                  int fl = fcntl(pu2[k]->lu_fd[pu2[k]->lunum], F_GETFL, 0);
+                  fcntl(pu2[k]->lu_fd[pu2[k]->lunum], F_SETFL,
+                        (fl < 0 ? 0 : fl) | O_NONBLOCK);
+               }
+#endif
                if (pu2[k]->lu_fd[pu2[k]->lunum] < 1) {
                   printf("\rPU2: accept failed for 3174-%01X %s\n", k, strerror(errno));
                } else {
@@ -1071,8 +1168,57 @@ int proc_3270 () {
          }  // End for int i
          for (BYTE j = 0; j < MAXLU; j++) {
             if (pu2[k]->lu_fd[j] > 0) {
+#if defined(__GENODE__)
+               /*
+                * POLL ONLY, AND LET THE REAL READ DECIDE, because lwIP's
+                * socket plugin has no ioctl at all: FIONREAD here returns -1
+                * with
+                *
+                *     Error: no plugin found for ioctl(36)
+                *
+                * and the line below takes that as a disconnect -- so a
+                * TN3270 client was accepted and dropped in the same
+                * millisecond, every time.
+                *
+                * MSG_PEEK WAS TRIED HERE AND IS NOT AN ANSWER. It was used
+                * to tell "no data" from "peer gone", on the premise that >0
+                * is data, 0 is a closed peer and EAGAIN is neither. On this
+                * lwIP a peek of one byte returns 0 on a live idle socket:
+                *
+                *     PU2: LU 00 connected to 3274-0
+                *     PU2: LU 00 peek=0 revents=0001
+                *     PU2: LU 00 disconnected from 3174-0
+                *
+                * -- POLLIN set, peer connected for another six minutes after
+                * that line, and the same symptom the peek was added to fix.
+                * MSG_PEEK lies in BOTH directions on this stack: it misses a
+                * close (which is why it was not trusted below either) and it
+                * reports one that has not happened.
+                *
+                * So pendingrcv is now just "poll says readable", and the
+                * recv below -- a real, consuming, non-blocking read -- is
+                * what distinguishes data from EAGAIN from a closed peer.
+                */
+               {
+                  struct pollfd pfd;
+
+                  pfd.fd = pu2[k]->lu_fd[j]; pfd.events = POLLIN; pfd.revents = 0;
+                  rc = 0;
+                  pendingrcv = 0;
+
+                  if (poll(&pfd, 1, 0) > 0) {
+                     if (pfd.revents & (POLLERR | POLLNVAL))
+                        rc = -1;
+                     else if (pfd.revents & POLLIN)
+                        pendingrcv = 1;
+                     else if (pfd.revents & POLLHUP)
+                        rc = -1;
+                  }
+               }
+#else
                rc = ioctl(pu2[k]->lu_fd[j], FIONREAD, &pendingrcv);
                if ((pendingrcv < 1) && (SocketReadAct(pu2[k]->lu_fd[j]))) rc = -1;
+#endif
                if (rc < 0) {
                   if (pu2[k]->actlu[j] == 1)  {                           /* Is actlu already done?                                 */
                       if (pu2[k]->bindflag[j] == 0)                       /* LU has no active BIND                                  */
@@ -1095,7 +1241,43 @@ int proc_3270 () {
                      pu2[k]->lunum = j;                                   /* ...replace with the just released LU number            */
                } else {
                   if (pendingrcv > 0) {
+                     /*
+                      * The fd is O_NONBLOCK from accept (see above), so
+                      * this cannot block: poll can say POLLIN on a socket
+                      * with nothing in it, and a blocking read there stops
+                      * the whole controller -- one entrypoint serves every
+                      * LU and the SDLC line.
+                      */
                      rc = read(pu2[k]->lu_fd[j], bfr, 256-BUFPD);
+#if defined(__GENODE__)
+                     /*
+                      * A READ OF ZERO IS NOT THE PEER GONE ON THIS STACK.
+                      *
+                      * The comment that used to stand here said it was the
+                      * one answer that cannot lie. Measured, with the socket
+                      * O_NONBLOCK and a client that stayed connected for
+                      * another three minutes:
+                      *
+                      *     PU2: DIAG F_GETFL=6 errno=0
+                      *     PU2: DIAG F_SETFL=0 errno=0
+                      *     PU2: LU 00 connected to 3274-0
+                      *     PU2: DIAG read rc=0 errno=0
+                      *
+                      * poll() reports POLLIN on an idle socket here and a
+                      * read of it returns 0 with errno untouched -- exactly
+                      * what a closed peer returns. MSG_PEEK was tried before
+                      * this and returns 0 on the same idle socket. NOTHING in
+                      * poll/peek/read tells "empty" from "closed" on this
+                      * lwIP, so an idle terminal was dropped on every
+                      * connect and no session could ever be established.
+                      *
+                      * So a quiet read is treated as quiet. A real close is
+                      * taken from POLLHUP/POLLERR above, and from the write
+                      * path when the host next has something to send.
+                      */
+                     if (rc <= 0)
+                        continue;
+#endif
                      //******
                      if (Tdbg_flag == ON) {              // Trace
                         fprintf(T_trace, "\n%s 3270 Read Buffer: ",TimeStamp());
@@ -1195,6 +1377,27 @@ void main(int argc, char *argv[]) {
       time_t tme = time(NULL);
       struct tm *currentTime = localtime(&tme);
       T_trace = fopen("trace_3274.log", "w");
+#if defined(__GENODE__)
+      /*
+       * /dev/log, NOT /dev/null.
+       *
+       * A relative path at a read-only VFS root gives NULL and the next
+       * fprintf is a null dereference -- the same trap as
+       * upstream/ibm3705/06-trace-file-null-deref.md, and /dev/null makes it
+       * safe. But safe is not useful: -d exists to show the SDLC frames, and
+       * a component with nowhere to put a file still has somewhere to put a
+       * LINE. The trace goes to the run log, where whoever asked for it is
+       * already looking.
+       *
+       * Unbuffered, because a trace that is still in a buffer when the thing
+       * being traced wedges is not a trace.
+       */
+      if (T_trace == NULL) {
+         T_trace = fopen("/dev/log", "w");
+         if (T_trace != NULL)
+            setvbuf(T_trace, NULL, _IONBF, 0);
+      }
+#endif
       fprintf(T_trace, "     ****** 3274 Terminal Controller log file ****** \n"
                        "     ******             Date: %02d/%02d/%04d             ****** \n\n"
                        "     i3274 -d : trace all 3274 activities\n\n",
@@ -1202,6 +1405,28 @@ void main(int argc, char *argv[]) {
       fflush(T_trace);
 
    }
+#if defined(__GENODE__)
+   /*
+    * NO SOCKET, NO CONNECT AND NO RETRY LOOP.
+    *
+    * Upstream resolves the host running the 3705, connects to
+    * SDLCLBASE+linenum and spins in a one-second retry until something
+    * answers -- because with TCP the 3705 may not be listening yet. Here the
+    * line is a terminal_crosslink that was opened before either program
+    * started, so there is nothing to wait for: the descriptor exists, and a
+    * frame written into it before the 3705 reads is buffered rather than
+    * refused. Which line this is comes from the component configuration; see
+    * genode_line.h.
+    */
+   linenum = (int) genode_line_number();
+   if (genode_line_open() != 0)
+      return;
+   pusdlc_fd = genode_line_fd();
+   if (Fdx)
+      pusdlc2_fd = genode_line_fd_sec();
+   printf("\rPU2: SDLC line %d is a crosslink; no connection to establish\n",
+          linenum);
+#else
    // SDLC line socket creation
    pusdlc_fd = socket(AF_INET, SOCK_STREAM, 0);
    if (pusdlc_fd <= 0) {
@@ -1238,18 +1463,46 @@ void main(int argc, char *argv[]) {
          sleep(1);
       }
    }
+#endif
    printf("\rPU2: SDLC line %d connection has been established\n",linenum);
    // Now 'IML' the 3274
    rc = proc_PU2iml();
    FptrI = 0;
    while (1) {
       rc = proc_3270();
+#if defined(__GENODE__)
+      /*
+       * A crosslink has no ioctl. The question being asked is "is there
+       * anything on the line", and xlink_avail answers it -- with a timeout,
+       * because a zero one does not work on this transport; see
+       * ../xlink/genode_xlink.h. pendingrcv becomes a flag rather than a
+       * count, and the read below reads what is there instead of exactly
+       * that many bytes, which is what a socket read did anyway.
+       */
+      pendingrcv = xlink_avail(pusdlc_fd, 10) ? (int) sizeof(SDLCreqb) : 0;
+      rc = 0;
+#else
       rc = ioctl(pusdlc_fd, FIONREAD, &pendingrcv);
       if ((pendingrcv < 1) && (SocketReadAct(pusdlc_fd))) rc = -1;
+#endif
       if (rc < 0) {                                      // Retry once to account for timing delays in TCP.
          if ((pendingrcv < 1) && (SocketReadAct(pusdlc_fd))) rc = -1;
       }
       if (rc < 0) {
+#if defined(__GENODE__)
+         /*
+          * A CROSSLINK HAS NO RECONNECT. It is open for as long as both
+          * components are, and there is no listener to connect back to --
+          * the same property the 3705's own IsSocketConnected reports, and
+          * the same limitation: restarting one end of a line mid-session
+          * needs something this transport does not have. See COMM3705.md.
+          * rc is never negative above, so this is unreachable and says so
+          * rather than pretending to recover.
+          */
+         printf("\rPU2: SDLC line failed and a crosslink cannot be "
+                "re-established\n");
+         return;
+#else
          printf("\rPU2: SDLC line dropped, trying to re-establish connection\n");
          // SDLC line socket recreation
          close(pusdlc_fd);
@@ -1275,10 +1528,14 @@ void main(int argc, char *argv[]) {
            } // End while
          }  // End if (Fdx)
          printf("\rPU2: SDLC line connection has been re-established\n");
-
+#endif
       } else {
          if (pendingrcv > 0) {
+#if defined(__GENODE__)
+            SDLCreql = xlink_read(pusdlc_fd, SDLCreqb, pendingrcv);
+#else
             SDLCreql = read(pusdlc_fd, SDLCreqb, pendingrcv);
+#endif
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s 3274 Request Buffer (%d): ", TimeStamp(),SDLCreql);
                for (int i=0; i < SDLCreql; i ++) {
@@ -1375,9 +1632,20 @@ void main(int argc, char *argv[]) {
                   Fptr = Fptr2[FptrI-1];                 // Get the pointer to the last frame
                   SDLCrspb[Fptr+FCntl] |= CFinal;        // Set the final bit;
                   if (Fdx)
+#if defined(__GENODE__)
+                     /* Whole message: a crosslink returns a short count
+                        rather than blocking, so half a frame would go out
+                        with no error. See ../xlink/genode_xlink.h. */
+                     rc = xlink_write(pusdlc2_fd, SDLCrspb, SDLCrsptl);
+#else
                      rc = send(pusdlc2_fd, SDLCrspb, SDLCrsptl, 0);
+#endif
                   else
+#if defined(__GENODE__)
+                     rc = xlink_write(pusdlc_fd, SDLCrspb, SDLCrsptl);
+#else
                      rc = send(pusdlc_fd, SDLCrspb, SDLCrsptl, 0);
+#endif
                   if (Tdbg_flag == ON) {
                      fprintf(T_trace, "%s 3274 Response Buffer (%d): ",TimeStamp(),SDLCrsptl);
                      for (int i=0; i < SDLCrsptl; i ++) {

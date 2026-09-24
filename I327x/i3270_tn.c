@@ -41,13 +41,30 @@
 #include <ifaddrs.h>
 #include "i327x.h"
 #include "codepage.c"
+#if defined(__GENODE__)
+#include <poll.h>
+#include <errno.h>
+#endif
+#if !defined(__GENODE__)
+/* Included and never used: nothing in this file calls epoll. Genode has no
+   <sys/epoll.h> at all, so the include alone is a build failure. */
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#if defined(__GENODE__)
+/*
+ * libbsd's string.h, for strlcpy and friends. Genode's libc HAS them -- it is
+ * FreeBSD's -- and declares them in <string.h>, which is already included
+ * above. There is no libbsd here and none is wanted: the header is a Linux
+ * accommodation for functions this platform has natively.
+ */
+#else
 #include <bsd/string.h>
+#endif
 
 #if !defined(min)
 #define  min(a,b)   (((a) <= (b)) ? (a) : (b))
@@ -188,6 +205,51 @@ int  nleft, nwritten;
 int send_packet(int csock, BYTE *buf, int len, char *caption) {
 int  rc;                                /* Return code               */
 
+#if defined(__GENODE__)
+   /*
+    * A WHOLE-MESSAGE SEND, WITH RETRIES, and both halves are needed.
+    *
+    * The listening socket is created SOCK_NONBLOCK and the accepted one
+    * inherits it here, so a send that cannot take everything returns EAGAIN
+    * rather than blocking -- and one line up, a single send() that returns
+    * negative is reported as "send to client failed" and the session is
+    * dropped. What that looked like was a TN3270 client completing the whole
+    * telnet negotiation, down to DO/WILL END OF RECORD, and then being hung
+    * up on before the first 3270 data stream: "RCVD disconnect" in s3270's
+    * trace, and "send to client failed" in the controller's log.
+    *
+    * A partial send is the same bug more quietly: this function ignored
+    * rc < len and returned success, so half a 3270 data stream would go out
+    * and the client would wait for the rest forever.
+    *
+    * Same loop and same reasoning as the crosslink's xlink_write, which is
+    * why that one is a shared file; this one cannot use it, because a socket
+    * is not a crosslink and EAGAIN is the difference.
+    */
+   {
+      int sent = 0;
+
+      while (sent < len) {
+         rc = send(csock, buf + sent, len - sent, 0);
+
+         if (rc > 0) { sent += rc; continue; }
+
+         if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd p;
+            p.fd = csock; p.events = POLLOUT; p.revents = 0;
+            if (poll(&p, 1, 1000) > 0 && (p.revents & POLLOUT))
+               continue;
+            printf("\nsend to client timed out");
+            return -1;
+         }
+         if (rc < 0 && errno == EINTR) continue;
+
+         printf("\nsend to client failed (%s)", strerror(errno));
+         return -1;
+      }
+      return 0;
+   }
+#else
    rc = send (csock, buf, len, 0);
 
    if (rc < 0) {
@@ -196,6 +258,7 @@ int  rc;                                /* Return code               */
    } // end if(rc)
 
    return 0;
+#endif
 
 }  // end function send_packet */
 
@@ -224,6 +287,35 @@ int   rcvlen = 0;                       /* Length of data received   */
    while (rcvlen < reqlen) {
 
       rc = recv (csock, buf + rcvlen, reqlen - rcvlen, 0);
+
+#if defined(__GENODE__)
+      /*
+       * EAGAIN IS NOT AN ERROR, AND THIS SOCKET IS NON-BLOCKING.
+       *
+       * The listening socket is created SOCK_NONBLOCK and the accepted one
+       * inherits it, so every receive here can return EAGAIN simply because
+       * the client's next byte has not arrived yet -- and one line down,
+       * rc < 0 is a hard failure that closes the session.
+       *
+       * What that looked like was a TN3270 client completing the telnet
+       * negotiation as far as DO/WILL END OF RECORD and then being hung up
+       * on, every time, at whichever step first needed the controller to
+       * WAIT rather than find the answer already buffered. In s3270's trace
+       * it is "RCVD disconnect" four exchanges in.
+       *
+       * Waiting is what poll is for. The timeout is generous because this is
+       * negotiation with a human's terminal emulator, not a channel.
+       */
+      if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+         struct pollfd p;
+         p.fd = csock; p.events = POLLIN; p.revents = 0;
+         if (poll(&p, 1, 5000) > 0 && (p.revents & POLLIN))
+            continue;
+         return -1;
+      }
+      if (rc < 0 && errno == EINTR)
+         continue;
+#endif
 
       if (rc < 0) {
          // WRMSG(HHC01034, "E", "recv()", strerror(HSO_errno));
