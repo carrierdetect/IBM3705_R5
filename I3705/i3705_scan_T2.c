@@ -266,6 +266,7 @@ extern uint8_t RS232[MAX_LINES];       /* RS232 signals                         
 int8 CS2_req_L2_int = OFF;
 pthread_mutex_t icw_lock;              // ICW lock (0 - 45)
 extern pthread_mutex_t rs232_lock;            // RS232 signal lock
+extern void LIB_signals(int k);               // grant CTS on demand (i3705_lib.c)
 
 // Trace variables
 uint16_t Sdbg_reg = 0x00;              // Bit flags for debug/trace
@@ -666,6 +667,15 @@ void *CS2_thread(void *arg) {
 
                if (!(RS232[line] & CTS)) {           // if not CTS, skip and try again later
                   RS232[line] |= RTS;                // Raise Request To Send
+#if defined(__GENODE__)
+                  /* Grant it NOW. Upstream runs the DCE signal rules from
+                     its epoll loop, on every socket event; this port runs
+                     them from a 20 Hz sweep, which put a 50 ms floor under
+                     every turnaround -- native's median was 18 ms and this
+                     port could not beat 50. Calling it here costs nothing
+                     and needs no faster sweep. */
+                  LIB_signals(line);
+#endif
                   break;
                }
 

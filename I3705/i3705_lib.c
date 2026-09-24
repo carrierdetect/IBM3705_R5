@@ -92,6 +92,7 @@
 */
 
 #include <stdbool.h>
+extern volatile unsigned long tw_count[8];
 #include "sim_defs.h"
 #include "i3705_defs.h"
 #if defined(__GENODE__)
@@ -306,6 +307,9 @@ static bool IsSocketConnected(int sockfd) {
 //*******************************************************************************************
 // Check the RS232 signals from the DTE, Update DCE accordingly                             *
 //*******************************************************************************************
+int16 LibSigMs   = 50;   /* ReadSig poll period in ms (background sweep)  */
+int16 LinePollMs = 0;    /* genode_ca_avail timeout on the line receive   */
+
 static void ReadSig(int k) {
    int rc, pendingrcv;
    uint8_t sig;
@@ -341,6 +345,19 @@ static void ReadSig(int k) {
    return;
 }
 //*********************************************************************
+// Run the DCE signal rules for one line, on demand.                  *
+//                                                                    *
+// ReadSig() is the only place CTS is granted, and upstream reaches it *
+// from the epoll loop -- on every socket event. This port reaches it  *
+// from a timed sweep, so the scanner, which raises RTS and then skips *
+// until CTS appears, used to wait for that sweep on EVERY frame.      *
+// The scanner calls this the moment it raises RTS instead.           *
+//*********************************************************************
+void LIB_signals(int k) {
+   if (k >= 0 && k < MAX_LINES) ReadSig(k);
+}
+
+//*********************************************************************
 // Receive data from the line (SDLC or BSC frame)                     *
 // If an error occurs, the connection will be closed                  *
 //*********************************************************************
@@ -353,21 +370,27 @@ int ReadLIB(int k) {
       if (IsSocketConnected(LIBline[k]->d327x_fd)) {                // ...and if it is still alive...
          pendingrcv = 0;
 #if defined(__GENODE__)
-         /* TIMEOUT 0, NOT 10, AND THE DIFFERENCE IS THE WHOLE LINE.
-          *
-          * Upstream asks ioctl(FIONREAD) here, which answers instantly with a
-          * byte count. This is the SCANNER asking for the next received
-          * CHARACTER (proc_LIBrdata calls it whenever the line buffer is
-          * empty), so it is on the hot path and is reached for every line on
-          * every scan cycle. A 10 ms wait turns "is there a character?" into
-          * a sleep, and with four lines that is up to 40 ms of dead time per
-          * cycle. The receive side then cannot keep up with the line: bytes
-          * all arrive correctly, but the far NCP's N(R) stops advancing, it
-          * retransmits, and the remote load dies on FRMR.
-          *
-          * poll() with a zero timeout is what FIONREAD meant: ask, do not
-          * wait. */
-         pendingrcv = genode_ca_avail(LIBline[k]->d327x_fd, 0);
+         /* TIMEOUT 0. Not 10 -- that stalls the scanner's character path
+          * whenever no character has arrived, the far NCP's N(R) stops
+          * advancing, and the load dies on FRMR. Not 1 either: measured, a
+          * 1 ms poll here STALLS the load outright (channel SIO went 8, 25,
+          * 26, 26 and stopped). genode_ca.h warns that a zero timeout never
+          * lets the entrypoint's read_avail handler fill the buffer, and
+          * that is true -- what makes it work anyway is that the scanner
+          * sleeps elsewhere and the entrypoint gets its turn there. Which is
+          * also why pacing the scanner to sleep LESS made throughput worse.
+          * This is a balance that is currently held by accident, and the
+          * results file says so. */
+         /*
+          * LINEPOLL makes the timeout above settable at run time. It
+          * defaults to 0, i.e. to the behaviour described above, and the
+          * rejections of 1 and 10 still stand as written: a blocking poll
+          * here stalls the SCANNER THREAD for every line that has no data
+          * waiting, which has nothing to do with the relay and channel
+          * spins that 0013 and 0014 removed. The knob exists to make that
+          * re-measurable, not because a non-zero value is known to be safe.
+          */
+         pendingrcv = genode_ca_avail(LIBline[k]->d327x_fd, LinePollMs);
          rc = 0;
 #else
          rc = ioctl(LIBline[k]->d327x_fd, FIONREAD, &pendingrcv);   // ...check for any data in the TCP buffer
@@ -557,10 +580,31 @@ void *LIB_thread(void *arg)
       printf("\rLIB: Line-%d attached\n", j + LIBLBASE);
    }
 
+   /*
+    * ReadSig() is the ONLY place CTS is granted, and the scanner blocks on
+    * that grant: i3705_scan_T2.c PCF state 8 raises RTS and then skips,
+    * retrying, until CTS comes up. PCF C and D drop and re-raise RTS on every
+    * Tx->Rx turnaround, so EVERY frame needs a fresh grant.
+    *
+    * Upstream calls ReadSig from the epoll loop, i.e. on every socket event.
+    * This loop used to run at 20 Hz (usleep(50000)), which turned a per-frame
+    * handshake into a sampled one and put a hard 50 ms floor under every
+    * turnaround: measured against the native reference on the same trunk
+    * load, native's median turnaround was 18 ms with 96% inside 10-25 ms,
+    * while this port could not beat 50 ms and had 197 stalls of >= 1.5 s in
+    * 792 frames against native's 2 in 5052.
+    *
+    * DEPOSIT LIBSIG 50 IN THE .cnf restores the old 20 Hz behaviour.
+    *
+    * usleep(), not genode_pace_us(): there is ONE shared pace timer and a
+    * Timer::Connection must not be shared between threads. The period is in
+    * whole milliseconds because libc's usleep floors there anyway.
+    */
    while (1) {
       for (int k = 0; k < MAX_LINES; k++)
          ReadSig(k);
-      usleep(50000);
+      tw_count[5]++;
+      usleep((LibSigMs > 0 ? LibSigMs : 1) * 1000);
    }
    return NULL;
 #else

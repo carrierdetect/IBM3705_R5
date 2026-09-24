@@ -275,6 +275,8 @@ int8  rpl        = OFF;                                 /* Remote Program Loader
 int8  CAdisable  = FALSE;                               /* Disable all CA's             */
 int16 ScanSpin   = 0;                                   /* Scanner paces by spin, not sleep */
 int16 IdleRest   = 1;                                   /* Rest the loader when nothing arrives */
+extern int16 LibSigMs;                                  /* ReadSig poll period, ms (i3705_lib.c) */
+extern int16 LinePollMs;                                /* Line receive poll timeout, ms         */
 int8  load_prsd  = FALSE;                               /* Load button pressed          */
 int32 lvl;                                              /* Active Program Level (1...5) */
 int32 Grp;                                              /* Active Register Group (0...3) */
@@ -454,6 +456,8 @@ REG cpu_reg[] = {
     { HRDATA (CADISABLE, CAdisable, 16) },
     { HRDATA (SCANSPIN, ScanSpin, 16) },
     { HRDATA (IDLEREST, IdleRest, 16) },
+    { HRDATA (LIBSIG,   LibSigMs, 16) },
+    { HRDATA (LINEPOLL, LinePollMs, 16) },
     { HRDATA (WRU, sim_int_char, 8) },
     { HRDATA (SHWLIB, shwlib, 8) },
     { HRDATA (DEBUG, debug_reg, 16) },
