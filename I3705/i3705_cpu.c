@@ -195,6 +195,9 @@ extern void genode_cpu_pace_us(unsigned us); /* ...this thread's own connection 
 #define I3705_IDLE_REST_AFTER  (2ULL * I3705_TSC_PER_SEC)
 #define I3705_IDLE_REST_US     200u
 static unsigned long long idle_since = 0;      /* rdtsc when busy last went false */
+/* Requests SERVICED, not requests outstanding. See the gate below. */
+static volatile unsigned long work_done = 0;
+static unsigned long          work_seen = 0;
 /* Which program level the CPU is actually executing, counted per pass.
    debug_reg 0x02 prints on every level ENTRY, which at ~600 entries/s
    over a serial console halts the machine it is meant to observe. This
@@ -982,7 +985,29 @@ while (reason == 0) {                          /* Loop until halted */
       int busy = (IdleRest == 2) ? 0 :
                  (int_lvl_req[2] == ON) ||
                  CA1_IS_req_L3 || CA1_DS_req_L3 || pci_req_L3;
-      if (busy) {
+      /*
+       * RESET ON PROGRESS, NOT ON A PENDING REQUEST.
+       *
+       * busy reads request FLAGS, and a flag that nothing will ever
+       * service stays set: with no host on the channel this machine
+       * made 12.75 MILLION level-3 passes a second with idle=0,
+       * because timer, pci and CA1_IS were all latched on. The cost
+       * is not local -- the 3705 beside it saw its timed waits go
+       * from 1 ms to 30-36 ms and its scanner fall to 84 cycles/s.
+       *
+       * work_done counts requests CLEARED, which is the one thing a
+       * latched flag never does. Three earlier gates failed by
+       * reading levels instead (all-levels: L1 is latched from reset;
+       * levels 2-5: L3 housekeeping is permanently pending; L2 alone:
+       * a channel load never raises L2). A clear survives all three:
+       * an arriving channel load clears CA1_IS/DS on every CCW.
+       *
+       * The interval timer's clear is deliberately NOT counted -- it
+       * ticks whether or not anything is happening, which is what
+       * made it useless as a busy signal in the first place.
+       */
+      if (busy || work_done != work_seen) {
+         work_seen  = work_done;
          idle_since = 0;
       } else {
          unsigned long long const now_i = __builtin_ia32_rdtsc();
@@ -2292,6 +2317,7 @@ while (reason == 0) {                          /* Loop until halted */
                Eregs_Inp[0x77] &= ~0x4000;     /* Reset L2 flag */
                // An Input x'40' will reset L2 req
                svc_req_L2 = OFF;               /* Reset L2 request flag */
+               work_done++;   /* a scanner character was taken */
                pthread_mutex_unlock(&r77_lock);
                /* Wake the scanner NOW. It blocks here rather than polling:
                   see sp_l2_wait() in i3705_scan_T2.c, which records what
@@ -2499,7 +2525,9 @@ while (reason == 0) {                          /* Loop until halted */
                   Eregs_Inp[0x77] &= ~0x0028;  // Reset CA L3  interrupt
                   pthread_mutex_unlock(&r77_lock);
                   CA1_IS_req_L3 = OFF;
+                  work_done++;   /* the channel's request was serviced */
                   CA1_DS_req_L3 = OFF;
+                  work_done++;   /* the channel's request was serviced */
                }
                if (Eregs_Out[0x57] & 0x0020) { // Reset CA L1 interrupt
                   Eregs_Inp[0x76] &= ~0x0400;  // Reset CA L1  interrupt
@@ -2561,6 +2589,7 @@ while (reason == 0) {                          /* Loop until halted */
                   Eregs_Inp[0x77] &= ~0x0008;  // Reset L3 initial selection
                   pthread_mutex_unlock(&r77_lock);
                   CA1_IS_req_L3 = OFF;
+                  work_done++;   /* the channel's request was serviced */
                   Eregs_Inp[0x60] &= ~0x8200;  // Reset NSC status bits
                }
                if (Eregs_Out[0x62] & 0x0200) { // Reset CA1 L3 data service
@@ -2568,6 +2597,7 @@ while (reason == 0) {                          /* Loop until halted */
                   Eregs_Inp[0x77] &= ~0x0010;  // Reset L3 data service
                   pthread_mutex_unlock(&r77_lock);
                   CA1_DS_req_L3 = OFF;
+                  work_done++;   /* the channel's request was serviced */
                }
                if (Eregs_Out[0x62] & 0x1000)
                   Eregs_Inp[0x62] |= 0x1000;   // Set NSC Channel end
@@ -2626,6 +2656,7 @@ while (reason == 0) {                          /* Loop until halted */
                }
                if (w_byte & 0x0020)            // Reset PCI L3 ?
                   pci_req_L3 = OFF;
+                  work_done++;   /* a program call was serviced */
                if (w_byte & 0x0002)            // Reset PCI L4 ?
                   pci_req_L4 = OFF;
                if (w_byte & 0x0001)            // Reset SVC L4 ?
