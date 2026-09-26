@@ -410,6 +410,41 @@ int proc_BSC(uint8_t* BSC_tbuf, uint16_t BSCtlen) {
                //************************************************************
                if (rc == 0) ACKreq = 1;
                   else NAKreq = 1;
+#if defined( __GENODE__ )
+               /* A FAILED SEND IS THE ONLY WAY WE LEARN A CLIENT HAS GONE.
+                *
+                * Genode's libc poll() sets only POLLIN and POLLOUT -- there is
+                * a literal "XXX POLLERR not supported" in vfs_plugin.cc -- so
+                * the POLLERR/POLLNVAL/POLLHUP branch in the read loop below
+                * can never fire here. read() and MSG_PEEK are no better: on
+                * this lwIP an idle socket answers as though the peer had gone,
+                * which is why that loop must not close on a quiet read.
+                *
+                * So the write path is all there is, and until now it only
+                * NAKed: the slot stayed occupied by a client that no longer
+                * existed, with not_ready still 0. VTAM then retried into the
+                * void and gave up, and every later client on this boot found
+                * terminal 0 taken. Observed on genherc 2026-09-26, where it
+                * cost a boot.
+                *
+                * Releasing it here mirrors the disconnect path below, and
+                * not_ready = 1 matters as much as the close: it is what lets
+                * the Device End branch tell VTAM the terminal came ready when
+                * a new client attaches, so the line recovers instead of
+                * staying dark until reboot. */
+               if (rc != 0 && clu[0]->lu_fd[0] > 0) {
+                  printf("\rCLU: send to terminal 0 on 3271-0 failed (%s);"
+                         " releasing it\n", strerror(errno));
+                  clu[0]->not_ready[0] = 1;
+                  if (ioblk[0][0] != NULL) { free(ioblk[0][0]); ioblk[0][0] = NULL; }
+                  clu[0]->actlu[0] = 0;
+                  close (clu[0]->lu_fd[0]);
+                  clu[0]->lu_fd[0] = 0;
+                  clu[0]->is_3270[0] = 0;
+                  if (clu[0]->lunum > 0 || clu[0]->lunum == 0xFF)
+                     clu[0]->lunum = 0;      /* terminal 0 is available again */
+               }
+#endif
             } else {
                if (Tdbg_flag == ON)
                   fprintf(T_trace, "%s CRC error: actual: %04X Received: %04X\n", TimeStamp(), CRCds, CRCck);
