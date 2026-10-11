@@ -182,6 +182,22 @@ static void sp_calibrate(void) {
    printf("\rSCANPERF: calibrated %llu tsc/us over %llu us\n",
           (unsigned long long)sp_tsc_per_us, (unsigned long long)us);
 }
+/* The TSC rate in MHz, for every figure in this file that is quoted per
+   second or per microsecond. Those divisors used to be literals: 1980 for
+   the TWCOUNT/s rates and 2100 for the per-pass microseconds, the first of
+   them labelled "genherc's i3-8145U" in i3705_cpu.c. On a host whose TSC
+   runs at a different rate every one of them is wrong by that ratio -- on
+   ms01a, 2995 MHz against 1980, every TWCOUNT/s read 1.51x high, and a
+   figure labelled per second was per 0.66 second. sp_calibrate() has been
+   in this file all along, measuring tsc/us against CLOCK_MONOTONIC; it was
+   simply only called when SCANSPIN was on. The lazy call here is a
+   backstop: the scanner calibrates at start-up when the TWCOUNT bit is
+   set, so the 100 ms this costs lands before any interval is being
+   measured rather than inside one. */
+static double sp_tsc_mhz(void) {
+   if (!sp_tsc_per_us) sp_calibrate();
+   return (double)sp_tsc_per_us;
+}
 /* Characterise usleep: actual vs requested, measured on CLOCK_MONOTONIC so
    no tsc calibration is involved. The question is whether the overrun is a
    fixed offset (a coarse wakeup) or proportional (a slow clock). */
@@ -472,6 +488,10 @@ void *CS2_thread(void *arg) {
        */
       setvbuf(S_trace, NULL, _IONBF, 0);
       Sdbg_flag = ON;
+      /* Calibrate the TSC now if the TWCOUNT/s report is wanted, so the
+         100 ms it costs is spent before the scanner loop starts rather
+         than inside a measured interval. See sp_tsc_mhz(). */
+      if (Sdbg_reg & 0x08) sp_calibrate();
    }
    /*
     * DO NOT CLOBBER A DEPOSIT FROM THE CONFIG FILE.
@@ -1122,7 +1142,7 @@ void *CS2_thread(void *arg) {
                   static uint64_t tw_last = 0;
                   uint64_t const nowt = sp_tsc();
                   if (tw_last) {
-                     double const secs = (double)(nowt - tw_last) / (1980.0*1000000.0);
+                     double const secs = (double)(nowt - tw_last) / (sp_tsc_mhz() * 1000000.0);
                      printf("\rTWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
                             tw_count[0]/secs, tw_count[1]/secs, tw_count[2]/secs,
                             tw_count[3]/secs, tw_count[4]/secs, tw_count[5]/secs,
@@ -1150,19 +1170,19 @@ void *CS2_thread(void *arg) {
                      for (int q = 0; q < 16; q++)
                         if (pcf_ent[ln][q])
                            printf(" %X=%.0fus/%lu", q,
-                                  pcf_tsc[ln][q]/(double)pcf_ent[ln][q]/2100.0,
+                                  pcf_tsc[ln][q]/(double)pcf_ent[ln][q]/sp_tsc_mhz(),
                                   pcf_ent[ln][q]);
                      printf("\n");
                      for (int q = 0; q < 16; q++) { pcf_tsc[ln][q]=0; pcf_ent[ln][q]=0; }
                      for (int q = 0; q < 16; q++) pcf_hist[ln][q] = 0;
                   }
                   printf("\rLVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
-                         lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/2100.0 : 0.0,
-                         lvl_hist[1] ? lvl_tsc[1]/(double)lvl_hist[1]/2100.0 : 0.0,
-                         lvl_hist[2] ? lvl_tsc[2]/(double)lvl_hist[2]/2100.0 : 0.0,
-                         lvl_hist[3] ? lvl_tsc[3]/(double)lvl_hist[3]/2100.0 : 0.0,
-                         lvl_hist[4] ? lvl_tsc[4]/(double)lvl_hist[4]/2100.0 : 0.0,
-                         lvl_hist[5] ? lvl_tsc[5]/(double)lvl_hist[5]/2100.0 : 0.0);
+                         lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/sp_tsc_mhz() : 0.0,
+                         lvl_hist[1] ? lvl_tsc[1]/(double)lvl_hist[1]/sp_tsc_mhz() : 0.0,
+                         lvl_hist[2] ? lvl_tsc[2]/(double)lvl_hist[2]/sp_tsc_mhz() : 0.0,
+                         lvl_hist[3] ? lvl_tsc[3]/(double)lvl_hist[3]/sp_tsc_mhz() : 0.0,
+                         lvl_hist[4] ? lvl_tsc[4]/(double)lvl_hist[4]/sp_tsc_mhz() : 0.0,
+                         lvl_hist[5] ? lvl_tsc[5]/(double)lvl_hist[5]/sp_tsc_mhz() : 0.0);
                   for (int z = 0; z < 6; z++) lvl_tsc[z] = 0;
                   tw_last = nowt;
                   for (int z = 0; z < 8; z++) tw_count[z] = 0;
