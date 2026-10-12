@@ -117,6 +117,12 @@ extern int32 Eregs_Out[];
 extern uint8 M[];
 extern int8  CA1_DS_req_L3;  // Chan Adap Data/Status request flag
 extern int8  CA1_IS_req_L3;  // Chan Adap Initial/Sel request flag
+/* For the interlock stall report only: what the emulated processor is doing
+   while the adapter waits for it. An interlock that never clears is one side
+   of a handshake, and the log has never carried the other side. */
+extern int8  int_lvl_req[1+5];  // Requested program levels, L1..L5
+extern int8  ncp_running;       // the loaded code has taken over
+extern int8  load_state;        // IPL load state
 
 // Trace variables
 uint16_t Adbg_reg = 0x00;    // Bit flags for debug/trace
@@ -146,6 +152,31 @@ void exec_ccw(struct IO3705 *iob);
 int reg_bit(int reg, int bit_mask);
 int Ireg_bit(int reg, int bit_mask);
 void wait();
+void wait_at(int line);
+/*
+ * EVERY INTERLOCK IN THIS FILE IS AN UNBOUNDED SPIN, and on 2026-10-12 one of
+ * them stopped coming back: the channel adapter waited on a bit the network
+ * control program never reset, the adapter's poll counter went to zero and its
+ * wait counter to 1141 a second, and the component printed nothing at all for
+ * the remaining twenty minutes of the run. The operating system saw its 370x
+ * load and then silence.
+ *
+ * There are twenty-two of these loops and they all look alike:
+ *
+ *     while (Ireg_bit(0x77, iob->CA_mask) == ON) wait();
+ *
+ * so the first question after a stall -- WHICH ONE -- had no answer in the
+ * log. This macro gives every call site its line number for nothing, and
+ * wait_at() reports a site it has been spinning on for about two seconds
+ * together with the registers the conditions are written against. It is a
+ * diagnostic and not a bound: breaking out of an interlock would leave the
+ * adapter's state machine half way through a channel program, which is worse
+ * than a hang and much harder to read.
+ *
+ * The plain wait() stays, because i3705_scan_T2.c and i3705_panel.c declare
+ * it extern and their waits are not interlocks.
+ */
+#define wait() wait_at(__LINE__)
 
 struct CCW {    /* Channel Command Word */
    uint8_t  code;
@@ -1579,8 +1610,70 @@ int Ireg_bit(int reg, int bit_mask) {
 // This subroutine waits 1 usec
 // ************************************************************
 #include <stdint.h>
+#undef wait
 void wait() {
+   wait_at(0);
+}
+
+/*
+ * wait_at(line) -- wait(), plus "which interlock is this and has it stopped
+ * making progress".
+ *
+ * The slots are keyed by thread because two threads run interlocks here: the
+ * adapter thread CAx_thread, which is where a channel program executes, and
+ * CA_T2_thread, which has four of its own. A single shared slot let each
+ * thread reset the other's count, so a genuine stall in one could go
+ * unreported forever while the other worked normally.
+ *
+ * CA_STALL_WAITS is about two seconds: a wait is measured at 0.5 to 1.2 ms
+ * depending on whether the Timer session or the libc floor is serving it, and
+ * no interlock in a healthy run holds for more than a handful. The report
+ * repeats at ten times the threshold so that a reader can tell a permanent
+ * stall from a long one, without flooding a log that has to carry the
+ * scanner's counters as well.
+ */
+#define CA_STALL_WAITS 2000L
+void wait_at(int line) {
+   static struct { unsigned long id; int line; long waits; } slot[4];
+   unsigned long const me = (unsigned long)pthread_self();
+   int i, free_slot = -1;
+
    tw_count[6]++;
+
+   for (i = 0; i < 4; i++) {
+      if (slot[i].id == me)
+         break;
+      if (slot[i].id == 0 && free_slot < 0)
+         free_slot = i;
+   }
+   if (i == 4) {
+      i = (free_slot >= 0) ? free_slot : 0;
+      slot[i].id = me;
+      slot[i].line = 0;
+   }
+
+   if (line != 0 && line == slot[i].line) {
+      slot[i].waits++;
+      if (slot[i].waits == CA_STALL_WAITS
+          || slot[i].waits % (CA_STALL_WAITS * 10L) == 0)
+         printf("CA: INTERLOCK STALL at i3705_chan_T2.c:%d after %ld waits -- "
+                "Inp77=%04X Inp55=%04X Inp5A=%04X Out55=%04X Out57=%04X "
+                "CA1mask=%04X CA2mask=%04X IS=%d DS=%d "
+                "lvl=%d%d%d%d%d ncp=%d load=%d\n\r",
+                line, slot[i].waits,
+                Eregs_Inp[0x77] & 0xFFFF, Eregs_Inp[0x55] & 0xFFFF,
+                Eregs_Inp[0x5A] & 0xFFFF, Eregs_Out[0x55] & 0xFFFF,
+                Eregs_Out[0x57] & 0xFFFF,
+                CAMASKS[0], CAMASKS[1],
+                (int)CA1_IS_req_L3, (int)CA1_DS_req_L3,
+                (int)int_lvl_req[0], (int)int_lvl_req[1], (int)int_lvl_req[2],
+                (int)int_lvl_req[3], (int)int_lvl_req[4],
+                (int)ncp_running, (int)load_state);
+   } else {
+      slot[i].line  = line;
+      slot[i].waits = 1;
+   }
+
 #if defined(__GENODE__)
    /* 22 interlocks in this file call this, constantly under an NCP load.
       libc rounds usleep(1) up to its 1 ms floor and measures ~1.2 ms; the
