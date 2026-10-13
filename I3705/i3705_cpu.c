@@ -214,6 +214,18 @@ volatile unsigned long long lvl_tsc[6];
    "L3 is asserted" does not say WHICH of these is stuck. Same method that
    separated L1/L2/L3 and found the channel-thread spinner. */
 volatile unsigned long l3_why[5];   /* inter, timer, pci, CA1_DS, CA1_IS */
+/*
+ * DOES THE X'55' LATCH FIX EVER FIRE?  Three cumulative counts:
+ *   [0] image stores to X'55' -- THE CONTROL.  If this is zero the
+ *       instrument never saw the path and the other two mean nothing;
+ *       "never fired" and "never ran" must not look alike.
+ *   [1] stores whose image would have cleared an ARMED OUTCWAR valid
+ *   [2] the same for INCWAR valid
+ * [1] and [2] are the exposure the latch fix removes.  If they stay at
+ * zero across a network control program load and an activation, the fix is
+ * inert on this path and should come out.
+ */
+volatile unsigned long x55_img[3];
 #include "i3705_defs.h"
 #include "i3705_Eregs.h"                                /* Exernal regs defs */
 #include <sys/time.h>
@@ -2459,8 +2471,15 @@ while (reason == 0) {                          /* Loop until halted */
              * So: an image SETS a latch and does not clear one.
              */
             if (Efld == 0x55) {
+               int32 const img = GR[Rfld][Grp];
                pthread_mutex_lock(&r55_lock);
-               Eregs_Out[0x55] = GR[Rfld][Grp] | (Eregs_Out[0x55] & 0x3000);
+               {
+                  int32 const armed = Eregs_Out[0x55] & 0x3000;
+                  x55_img[0]++;                   /* the control: path ran */
+                  if (armed & ~img & 0x1000) x55_img[1]++;
+                  if (armed & ~img & 0x2000) x55_img[2]++;
+                  Eregs_Out[0x55] = img | armed;
+               }
                pthread_mutex_unlock(&r55_lock);
             }
             else

@@ -146,6 +146,7 @@ volatile unsigned long tw_count[8];
 extern volatile unsigned long lvl_hist[6];
 extern volatile unsigned long long lvl_tsc[6];
 extern volatile unsigned long l3_why[5];
+extern volatile unsigned long x55_img[3];
 /* Where the scanner BODY goes. SCANPERF says 3705b spends ~50% of each
    cycle in the body against 3705a's 1%, and the only blocking things in
    it are the two svc_req_L2 waits. [0] first loop, [1] second loop while
@@ -1156,6 +1157,9 @@ void *CS2_thread(void *arg) {
                          l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
                          l3_why[3]/secs, l3_why[4]/secs);
                   for (int z = 0; z < 5; z++) l3_why[z] = 0;
+                  /* cumulative, NOT per window: these are totals for the run */
+                  printf("\rX55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
+                         x55_img[0], x55_img[1], x55_img[2]);
                   }
                   for (int ln = 0; ln < 2; ln++) {
                      unsigned long tot = 0;
