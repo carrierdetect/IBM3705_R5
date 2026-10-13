@@ -1157,9 +1157,25 @@ void *CS2_thread(void *arg) {
                          l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
                          l3_why[3]/secs, l3_why[4]/secs);
                   for (int z = 0; z < 5; z++) l3_why[z] = 0;
-                  /* cumulative, NOT per window: these are totals for the run */
-                  printf("\rX55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
-                         x55_img[0], x55_img[1], x55_img[2]);
+                  /*
+                   * Cumulative, NOT per window: these are totals for the run.
+                   * PRINTED ONLY WHEN ONE OF THEM CHANGES. Printed every
+                   * report instead, it added a log line to each of ~2400
+                   * reports, and each one is a synchronous write out of the
+                   * component -- which cost 2.6% of the scanner's rate beside
+                   * a partition that never yields, while costing nothing at
+                   * idle. The counters are free; the printing was not.
+                   */
+                  {
+                     static unsigned long x55_seen[3];
+                     if (x55_img[0] != x55_seen[0] ||
+                         x55_img[1] != x55_seen[1] ||
+                         x55_img[2] != x55_seen[2]) {
+                        printf("\rX55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
+                               x55_img[0], x55_img[1], x55_img[2]);
+                        for (int z = 0; z < 3; z++) x55_seen[z] = x55_img[z];
+                     }
+                  }
                   }
                   for (int ln = 0; ln < 2; ln++) {
                      unsigned long tot = 0;
