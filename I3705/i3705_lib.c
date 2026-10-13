@@ -607,7 +607,9 @@ void *LIB_thread(void *arg)
     * while this port could not beat 50 ms and had 197 stalls of >= 1.5 s in
     * 792 frames against native's 2 in 5052.
     *
-    * DEPOSIT LIBSIG 50 IN THE .cnf restores the old 20 Hz behaviour.
+    * DEPOSIT LIBSIG 50 IN THE .cnf restores the old 20 Hz behaviour. That
+    * instruction was wrong until the register became decimal: it is DRDATA
+    * now, and before that it deposited 0x50 -- 80 ms, or 12.5 Hz.
     *
     * usleep(), not genode_pace_us(): there is ONE shared pace timer and a
     * Timer::Connection must not be shared between threads. The period is in

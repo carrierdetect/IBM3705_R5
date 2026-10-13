@@ -349,6 +349,29 @@ int16 ScanSpin   = 0;                                   /* Scanner paces by spin
  */
 int16 ScanUs     = 500;                                 /* Scanner cycle pace, microseconds */
 /*
+ * CASTALL -- seconds before the channel adapter's ONE bounded interlock gives
+ * up and answers unit check instead of waiting for ever. 0 disables the bound
+ * and restores the unbounded wait. See i3705_chan_T2.c, ca_wait_outcwar().
+ *
+ * 60 s is 30x the ceiling the 2 s reporter has ever seen -- it did not fire
+ * once in 38 recorded activation exchanges -- and 5x under the operating
+ * system's own missing-interrupt interval, which reported the stall this
+ * exists for at about five minutes. NOT VALIDATED ON THE TRUNK: every one of
+ * those 38 was a LOCAL load, and the remote load over a trunk is the slow
+ * path, where a legitimate wait is longer by an unknown factor.
+ *
+ * CAFAULT -- seconds after the adapter's first Read at which to FORCE that
+ * interlock to time out, for testing the bound. 0 is off. It forces the
+ * BOUND, not the register bit: clearing the bit for real can self-heal,
+ * because 12 of 192 image stores in a load do carry it, so the park would
+ * resolve before the bound and the test would prove nothing. Set it past the
+ * network control program load -- that load reaches node-active in about
+ * 143 s -- so the fault lands in a later activation exchange and not in the
+ * operating system's start-up.
+ */
+int16 CaStallSecs = 60;                                 /* bound, seconds; 0 = unbounded */
+int16 CaFaultSecs = 0;                                  /* force the bound after n s; 0 = off */
+/*
  * BLOCK ON THE L2 HANDSHAKE INSTEAD OF POLLING IT. See sp_l2_wait() in
  * i3705_scan_T2.c for the mechanism and for what spinning costs.
  *
@@ -573,13 +596,32 @@ REG cpu_reg[] = {
     /* Misc */
     { HRDATA (RPL, rpl, 8) },
     { HRDATA (CADISABLE, CAdisable, 16) },
-    { HRDATA (SCANSPIN, ScanSpin, 16) },
-    { HRDATA (SCANUS,   ScanUs, 16) },
-    { HRDATA (L2SPIN,   L2Spin, 16) },
-    { HRDATA (IDLEREST, IdleRest, 16) },
-    { HRDATA (WAITUS,   WaitUs, 16) },
-    { HRDATA (LIBSIG,   LibSigMs, 16) },
-    { HRDATA (LINEPOLL, LinePollMs, 16) },
+    /*
+     * DRDATA, NOT HRDATA, AND THAT IS A FIX. HRDATA declares a register whose
+     * radix is SIXTEEN, so "deposit SCANUS 500" deposited 0x500 -- 1280. Every
+     * one of these holds a count of microseconds, milliseconds or seconds,
+     * which nobody writes in hex, and two of the instructions in this tree's
+     * own comments were wrong because of it: "DEPOSIT LIBSIG 50" to restore a
+     * 20 Hz poll set 0x50 = 80 ms, which is 12.5 Hz, and "DEPOSIT WAITUS 1000"
+     * to get the old millisecond back set 0x1000 = 4096 us.
+     *
+     * It cost three test runs of a channel-adapter timeout before the knob was
+     * made to report its own value: CAFAULT 240 and 180 were 576 s and 384 s,
+     * both past the end of the run that was waiting for them, and the runs
+     * came back green having tested nothing.
+     *
+     * DEBUGS, DEBUGA and CADISABLE stay HRDATA: the first two are bit masks,
+     * which hex suits, and the third is upstream's.
+     */
+    { DRDATA (SCANSPIN, ScanSpin, 16) },
+    { DRDATA (SCANUS,   ScanUs, 16) },
+    { DRDATA (CASTALL,  CaStallSecs, 16) },
+    { DRDATA (CAFAULT,  CaFaultSecs, 16) },
+    { DRDATA (L2SPIN,   L2Spin, 16) },
+    { DRDATA (IDLEREST, IdleRest, 16) },
+    { DRDATA (WAITUS,   WaitUs, 16) },
+    { DRDATA (LIBSIG,   LibSigMs, 16) },
+    { DRDATA (LINEPOLL, LinePollMs, 16) },
     { HRDATA (WRU, sim_int_char, 8) },
     { HRDATA (SHWLIB, shwlib, 8) },
     { HRDATA (DEBUG, debug_reg, 16) },
@@ -909,6 +951,8 @@ while (reason == 0) {                          /* Loop until halted */
        * the remote sat in WAIT for most of every stall.
        *
        * DEPOSIT WAITUS 1000 IN THE .cnf to get the old millisecond back.
+       * That is true now that the register is DRDATA; while it was HRDATA
+       * the same line deposited 0x1000, which is 4096 us.
        * Its own Timer connection, not the scanner's: usleep() on one blocks
        * on that connection's blockade and two threads must not share it.
        */

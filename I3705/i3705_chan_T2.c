@@ -24,6 +24,8 @@
 
 #include "sim_defs.h"
 #if defined(__GENODE__)
+extern int16 CaStallSecs;   /* deposit CASTALL <s> in the .cnf; 0 = unbounded */
+extern int16 CaFaultSecs;   /* deposit CAFAULT <s> in the .cnf; 0 = off     */
 extern void genode_pace_us(unsigned us);       /* the SCANNER's connection */
 extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
    NOT genode_pace_us: that one is the scanner's connection, and
@@ -159,7 +161,8 @@ void exec_ccw(struct IO3705 *iob);
 int reg_bit(int reg, int bit_mask);
 int Ireg_bit(int reg, int bit_mask);
 void wait();
-void wait_at(int line);
+int  wait_at(int line);
+static int ca_wait_outcwar(struct IO3705 *iob);
 /*
  * EVERY INTERLOCK IN THIS FILE IS AN UNBOUNDED SPIN, and on 2026-10-12 one of
  * them stopped coming back: the channel adapter waited on a bit the network
@@ -184,6 +187,24 @@ void wait_at(int line);
  * it extern and their waits are not interlocks.
  */
 #define wait() wait_at(__LINE__)
+
+/*
+ * ONE of the twenty-two is bounded, and only one. wait_at() now also measures
+ * how long a site has been spinning and returns 1 once it passes CASTALL
+ * seconds; ca_wait_outcwar() is the only caller that acts on it.
+ *
+ * Why only that one. Abandoning an interlock leaves the adapter's state
+ * machine part way through a channel program, which is worse than a hang and
+ * much harder to read -- so a bound is only safe where nothing has happened
+ * yet. The Read's wait for OUTCWAR-valid is that place: it is the first thing
+ * the Read does, before a byte moves, so giving up there is the same as never
+ * having started. It is also the park that actually happened.
+ *
+ * The others stay unbounded on purpose. The INCWAR-valid wait sits inside the
+ * Write's loop over control words, so it can be mid-transfer. The waits on
+ * X'77' leave a level-3 request outstanding that the emulated processor may
+ * service later, against registers the adapter has moved on from.
+ */
 
 struct CCW {    /* Channel Command Word */
    uint8_t  code;
@@ -692,6 +713,13 @@ void *CA_T2_thread(void *arg) {
    } epoll_Data_t;
 
    printf("CA-T2: Main thread %ld started succesfully...\n\r", THREAD_ID());
+   /* The knobs are NOT reported here. scp.c's main() creates this thread as
+      its very first act, before it parses any argument or runs the .cnf, so
+      anything read here is the compile-time default and not what the
+      configuration asked for -- which is how the first report of them said
+      CASTALL=60 while the .cnf had deposited something else. They are reported
+      from ca_wait_outcwar() instead, on its first call, which is after the
+      configuration has run. */
 
    // ********************************************************************
    // Channel Adapter debug trace facility
@@ -1182,8 +1210,11 @@ void exec_ccw(struct IO3705 *iob) {
             Eregs_Inp[0x53] &= 0x00FF;                   // Reset sense byte (in)
             Eregs_Out[0x53] &= 0x00FF;                   // Reset sense byte (out)
 
-            while (reg_bit(0x55, 0x1000) == OFF)
-               wait();                                   // Wait for OUTCWAR to become valid
+            if (ca_wait_outcwar(iob)) {                  // bounded; see ca_wait_outcwar()
+               carnstat = CSW_CEND | CSW_DEND | CSW_UCHK;
+               send_carnstat(iob->bus_socket[iob->abswitch], &carnstat, &ackbuf, iob->CA_id);
+               break;
+            }
             bufbase = 0;                                 // Set buffer base...
             wdcnttot = 0;                                // ... we will need this in case of chaining
 
@@ -1625,6 +1656,7 @@ int Ireg_bit(int reg, int bit_mask) {
 // This subroutine waits 1 usec
 // ************************************************************
 #include <stdint.h>
+#include <time.h>
 #undef wait
 void wait() {
    wait_at(0);
@@ -1648,10 +1680,10 @@ void wait() {
  * scanner's counters as well.
  */
 #define CA_STALL_WAITS 2000L
-void wait_at(int line) {
-   static struct { unsigned long id; int line; long waits; } slot[4];
+int wait_at(int line) {
+   static struct { unsigned long id; int line; long waits; struct timespec since; } slot[4];
    unsigned long const me = (unsigned long)pthread_self();
-   int i, free_slot = -1;
+   int i, free_slot = -1, timed_out = 0;
 
    tw_count[6]++;
 
@@ -1687,6 +1719,20 @@ void wait_at(int line) {
    } else {
       slot[i].line  = line;
       slot[i].waits = 1;
+      clock_gettime(CLOCK_MONOTONIC, &slot[i].since);
+   }
+
+   /*
+    * THE BOUND, measured in wall clock and not in waits. The wait counter is
+    * not a clock: a wait is 0.5 ms through the Timer session and 1.2 ms
+    * through the libc floor, so the same count is two different durations
+    * depending on which is serving it.
+    */
+   if (line != 0 && CaStallSecs > 0 && slot[i].since.tv_sec != 0) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec - slot[i].since.tv_sec >= CaStallSecs)
+         timed_out = 1;
    }
 
 #if defined(__GENODE__)
@@ -1722,6 +1768,89 @@ void wait_at(int line) {
 #else
    usleep(1);
 #endif
-   return;
+   return timed_out;
+}
+
+/*
+ * THE ONE BOUNDED INTERLOCK. The Read's wait for OUTCWAR-valid, which is the
+ * park that actually happened: the operating system loaded a network control
+ * program, the adapter waited here for a bit an image store to X'55' had
+ * cleared, and nothing was printed by anything for twenty minutes until the
+ * mainframe's missing-interrupt handler reported a channel program outstanding
+ * with neither channel end nor device end.
+ *
+ * That cause is fixed. This is the annunciator, and it is deliberately a
+ * separate change from the fix, because in one change a clean run cannot
+ * distinguish "the stall stopped happening" from "the stall started being
+ * survived".
+ *
+ * Giving up here is safe in a way it is nowhere else in this file: it is the
+ * first thing the Read does and no byte has moved, so abandoning is the same
+ * as never having started. The host is answered with channel end, device end
+ * and unit check, and sense byte 0 carries EQUIPMENT CHECK -- the honest
+ * meaning of "the control unit never armed a buffer". Sense byte 0 is the high
+ * byte of X'53'; CCW 0x04 returns it.
+ */
+static int ca_fault_due(void) {
+   static struct timespec first;
+   static int fired = 0;
+   struct timespec now;
+
+   if (CaFaultSecs <= 0 || fired) return 0;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   if (first.tv_sec == 0) { first = now; }
+   /*
+    * The first Read sets the origin, and the fault fires on the first Read
+    * AFTER the interval -- which may be well after it, because Reads arrive in
+    * bursts during an activation exchange and not continuously. The first test
+    * of this set CAFAULT=240 against a seven-minute run and left a
+    * twenty-four second window between the threshold and the last exchange;
+    * no Read fell in it and nothing fired. Choose a value that leaves at least
+    * one whole exchange after it.
+    */
+   if (now.tv_sec - first.tv_sec < CaFaultSecs) return 0;
+   fired = 1;
+   printf("\rCA: CAFAULT: forcing the OUTCWAR-valid interlock to time out, "
+          "%ld s after the first Read (CAFAULT=%d)\n\r",
+          (long)(now.tv_sec - first.tv_sec), CaFaultSecs);
+   return 1;
+}
+
+static int ca_wait_outcwar(struct IO3705 *iob) {
+   static int announced = 0;
+   int faulting;
+
+   /* FIRST USE, not thread start: see the note in CA_T2_thread. This is the
+      first Read, which is long after the .cnf has been processed, so these are
+      the values actually in force. */
+   if (!announced) {
+      announced = 1;
+      if (CaStallSecs > 0)
+         printf("\rCA: interlock bound CASTALL=%ds on the Read's OUTCWAR wait\n\r",
+                CaStallSecs);
+      else
+         printf("\rCA: interlock bound DISABLED (CASTALL=0); the wait is unbounded\n\r");
+      printf("\rCA: CAFAULT=%ds%s\n\r", CaFaultSecs,
+             CaFaultSecs > 0 ? " -- the bound will be FORCED that long from now"
+                             : " (off; the bound fires only on a real stall)");
+   }
+
+   faulting = ca_fault_due();
+
+   /* wait_at(__LINE__) and not wait(): this sits below the #undef, so wait()
+      here is the void function and not the macro that carries the line. */
+   while (faulting || reg_bit(0x55, 0x1000) == OFF)
+      if (wait_at(__LINE__)) {
+         Eregs_Inp[0x53] |= 0x1000;      /* sense byte 0 bit 3: equipment check */
+         Eregs_Out[0x53] |= 0x1000;
+         printf("\rCA%c: STALL BOUND: OUTCWAR valid never arrived in %d s -- "
+                "answering unit check. Out55=%04X Inp55=%04X Out57=%04X%s\n\r",
+                iob->CA_id, CaStallSecs,
+                Eregs_Out[0x55] & 0xFFFF, Eregs_Inp[0x55] & 0xFFFF,
+                Eregs_Out[0x57] & 0xFFFF,
+                faulting ? " (CAFAULT)" : "");
+         return 1;
+      }
+   return 0;
 }
 
