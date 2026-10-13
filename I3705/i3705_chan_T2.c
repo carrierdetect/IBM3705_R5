@@ -24,6 +24,7 @@
 
 #include "sim_defs.h"
 #if defined(__GENODE__)
+extern void genode_pace_us(unsigned us);       /* the SCANNER's connection */
 extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
    NOT genode_pace_us: that one is the scanner's connection, and
    Timer::Connection::usleep blocks on the connection's own blockade, so the
@@ -1691,11 +1692,33 @@ void wait_at(int line) {
 #if defined(__GENODE__)
    /* 22 interlocks in this file call this, constantly under an NCP load.
       libc rounds usleep(1) up to its 1 ms floor and measures ~1.2 ms; the
-      Timer session is Microseconds and measures ~0.51 ms at 500. This thread's
-      OWN connection: sharing the scanner's made the scanner queue behind the
-      channel, which is why a stalled run's wait counter and scanner rate
-      agreed to two cycles. */
-   genode_chan_pace_us(1);
+      Timer session is Microseconds and measures ~0.51 ms at 500.
+
+      DISPATCH ON line, AND NOT ON WHICH THREAD GETS HERE FIRST. Four threads
+      reach this function, not two: the macro at the top of this file gives
+      every call site in THIS file a line number, but i3705_scan_T2.c and
+      i3705_panel.c declare the plain wait() extern and call it, which arrives
+      as wait_at(0). Their waits are not interlocks.
+
+      The first version of this took a channel connection by first-come claim,
+      which was wrong in a way that would not have shown up in a healthy run:
+      the scanner's wait() at scan_T2.c:516 runs during start-up, so the
+      scanner and the panel could take both channel slots and leave the two
+      channel threads on the libc's 1 ms floor for every interlock and every
+      channel command word -- the exact inversion of the intent, silently, and
+      invisible unless the channel is busy.
+
+      line != 0 is therefore the discriminator, and it is exact: it means the
+      caller is in this file, so it is one of the two threads that run
+      interlocks here (CA_T2_thread and the adapter thread CAx_thread it
+      creates -- created ONCE, outside the MAXCHAN loop, so a second channel
+      adapter adds no thread and two slots is the structure rather than a
+      guess). line == 0 keeps what those callers had before: the scanner's own
+      connection, which is correct for the scanner. The panel sharing it is a
+      pre-existing instance of the same hazard at one cold call site, and is
+      left for its own change. */
+   if (line != 0) genode_chan_pace_us(1);
+   else           genode_pace_us(1);
 #else
    usleep(1);
 #endif
