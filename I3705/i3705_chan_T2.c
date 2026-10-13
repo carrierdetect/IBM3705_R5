@@ -24,7 +24,11 @@
 
 #include "sim_defs.h"
 #if defined(__GENODE__)
-extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
+extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
+   NOT genode_pace_us: that one is the scanner's connection, and
+   Timer::Connection::usleep blocks on the connection's own blockade, so the
+   two threads running interlocks here used to serialise with the scanner.
+   One connection per thread -- see port/genode/i3705/component.cc. */
 #endif
 extern volatile unsigned long tw_count[8];
 #include "i3705_defs.h"
@@ -1128,7 +1132,7 @@ void exec_ccw(struct IO3705 *iob) {
     * a real suspension and a real scheduling point. The cost is one
     * millisecond per CCW and an NCP load is 364 of them.
     */
-   genode_pace_us(1);   /* Timer session: libc rounds this to 1.2 ms */
+   genode_chan_pace_us(1);   /* Timer session: libc rounds this to 1.2 ms */
 #endif
    rc = read_socket_n( iob->bus_socket[iob->abswitch], (char *)iob->buffer, 8);
 
@@ -1687,8 +1691,11 @@ void wait_at(int line) {
 #if defined(__GENODE__)
    /* 22 interlocks in this file call this, constantly under an NCP load.
       libc rounds usleep(1) up to its 1 ms floor and measures ~1.2 ms; the
-      Timer session is Microseconds and measures ~0.51 ms at 500. */
-   genode_pace_us(1);
+      Timer session is Microseconds and measures ~0.51 ms at 500. This thread's
+      OWN connection: sharing the scanner's made the scanner queue behind the
+      channel, which is why a stalled run's wait counter and scanner rate
+      agreed to two cycles. */
+   genode_chan_pace_us(1);
 #else
    usleep(1);
 #endif
