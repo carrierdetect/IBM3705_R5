@@ -191,7 +191,16 @@ extern void genode_cpu_pace_us(unsigned us); /* ...this thread's own connection 
    machine", which is what the throttle is for. The frequency below only has
    to be the right order of magnitude: getting it wrong changes how long an
    abandoned 3705 waits before it stops burning a core, and nothing else. */
-#define I3705_TSC_PER_SEC      1980000000ULL   /* genherc's i3-8145U */
+/* A nominal 2 GHz, NOT a measurement of the host this runs on. Per the
+   paragraph above, only the order of magnitude matters: this sets how long an
+   abandoned 3705 waits before it stops burning a core, so being out by 50%
+   makes that two seconds or four. Nothing quoted per second or per
+   microsecond may be divided by this -- i3705_scan_T2.c's sp_tsc_mhz()
+   measures the counter against CLOCK_MONOTONIC and is what those figures use.
+   This constant was a particular development machine's rate, named as such,
+   and the eight divisors that WERE using it printed every rate on any other
+   host wrong by the ratio of the two clocks. */
+#define I3705_TSC_PER_SEC      2000000000ULL
 #define I3705_IDLE_REST_AFTER  (2ULL * I3705_TSC_PER_SEC)
 #define I3705_IDLE_REST_US     200u
 static unsigned long long idle_since = 0;      /* rdtsc when busy last went false */
