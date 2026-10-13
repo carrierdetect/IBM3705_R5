@@ -1211,6 +1211,33 @@ void exec_ccw(struct IO3705 *iob) {
             Eregs_Out[0x53] &= 0x00FF;                   // Reset sense byte (out)
 
             if (ca_wait_outcwar(iob)) {                  // bounded; see ca_wait_outcwar()
+#if defined(__GENODE__)
+               /*
+                * A ZERO-LENGTH DATA PHASE FIRST, AND THEN THE STATUS.
+                *
+                * On this platform a Read's data phase is two bytes of length
+                * followed by that many bytes, and the host reads the length
+                * BEFORE it reads status -- see "LENGTH FIRST" above, and
+                * comm3705.c, which does
+                *     want = (lenpfx[0] << 8) | lenpfx[1];
+                *     rc = want ? ipc_read_exact(..., want) : 0;
+                * so a length of zero is read correctly and falls through to
+                * the status read.
+                *
+                * The first version of this bound answered with the status
+                * alone. That desynchronises the wire: the host took the status
+                * byte as the first half of the length and waited for the
+                * second for ever, so the annunciator left the host in exactly
+                * the hang it exists to prevent -- the missing-interrupt
+                * handler still reported the device, five minutes later, and
+                * the node could not be activated again. Tested on hardware
+                * 2026-10-13 and that is how it was found.
+                */
+               {
+                  unsigned char lenpfx[2] = { 0, 0 };
+                  send(iob->bus_socket[iob->abswitch], (void*)lenpfx, 2, 0);
+               }
+#endif
                carnstat = CSW_CEND | CSW_DEND | CSW_UCHK;
                send_carnstat(iob->bus_socket[iob->abswitch], &carnstat, &ackbuf, iob->CA_id);
                break;
