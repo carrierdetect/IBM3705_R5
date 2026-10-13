@@ -243,6 +243,16 @@ extern int abar;                                        /* Attachment Buffer Add
 extern int abar_int;                                    /* ABAR of line interrupt (020-1FF) from CS2   */
 extern pthread_mutex_t icw_lock;                        /* CS2: ICW update lock */
 pthread_mutex_t r77_lock;                               /* CA2/CS2: Reg77 update lock */
+/*
+ * X'55' is read-modify-written by the channel adapter thread AND stored whole
+ * by this one, and the adapter's modifications bracket a wait: it loads the
+ * register, waits half a millisecond or more for a level-3 service, and then
+ * stores what it loaded with one bit changed -- discarding anything the
+ * control program stored in between. The lock makes each side's update
+ * atomic with respect to the other. It is held across three instructions and
+ * never across a wait.
+ */
+pthread_mutex_t r55_lock;                               /* CA2: Reg55 update lock */
 pthread_mutex_t r7f_lock;                               /* CCU: Reg7F update lock */
 
 uint8 M[MAXMEMSIZE] = { 0 };                            /* Memory 3705 */
@@ -2431,7 +2441,30 @@ while (reason == 0) {                          /* Loop until halted */
             if (Rfld == 0) break;              // Only regen of regs parity
             GR[Efld & 0x007][Efld >> 3] = GR[Rfld][Grp];
          } else {
-            Eregs_Out[Efld] = GR[Rfld][Grp];   // <<=== !!! Finally update I/O reg.
+            /*
+             * X'55' BITS 0x1000 AND 0x2000 ARE LATCHES, NOT IMAGE BITS.
+             *
+             * OUTCWAR-valid and INCWAR-valid are set by the control program
+             * when it arms a transfer and reset explicitly: through X'56'
+             * (just below), or by the channel adapter when it consumes the
+             * last control word (i3705_chan_T2.c, "reset INCWAR valid
+             * latch" -- the adapter's own word for it). An OUT X'55' stores
+             * a whole image, so an image that happens not to carry them was
+             * CLEARING them, which loses an arm the adapter is about to wait
+             * for. The adapter then waits for ever:
+             *     while (reg_bit(0x55, 0x1000) == OFF) wait();
+             * with nothing left to set it, no interrupt raised, and nothing
+             * printed. See port/results/3705-driven-ms01a.txt.
+             *
+             * So: an image SETS a latch and does not clear one.
+             */
+            if (Efld == 0x55) {
+               pthread_mutex_lock(&r55_lock);
+               Eregs_Out[0x55] = GR[Rfld][Grp] | (Eregs_Out[0x55] & 0x3000);
+               pthread_mutex_unlock(&r55_lock);
+            }
+            else
+               Eregs_Out[Efld] = GR[Rfld][Grp];   // <<=== !!! Finally update I/O reg.
 
             //********************************************************
             //          Communication Scanner Type 2 ICW updates
@@ -2509,6 +2542,7 @@ while (reason == 0) {                          /* Loop until halted */
                   Eregs_Out[0x54] |= 0x0100;   // ...set Unit Check
             }
             if (Efld == 0x56) {                // Channel Adapter Mode
+               pthread_mutex_lock(&r55_lock);
                if (Eregs_Out[0x56] & 0x2000) {
                   Eregs_Inp[0x55] &= ~0x2000;  // Reset INCWAR valid
                   Eregs_Out[0x55] &= ~0x2000;  // Reset INCWAR valid
@@ -2517,17 +2551,18 @@ while (reason == 0) {                          /* Loop until halted */
                   Eregs_Inp[0x55] &= ~0x1000;  // Reset OUTCWAR valid
                   Eregs_Out[0x55] &= ~0x1000;  // Reset OUTCWAR valid
                }
+               pthread_mutex_unlock(&r55_lock);
             }
 
             if (Efld == 0x57) {                // Channel Adapter Mode
                if (Eregs_Out[0x57] & 0x0010) { // Reset CA L3 interrupt
                   pthread_mutex_lock(&r77_lock);
                   Eregs_Inp[0x77] &= ~0x0028;  // Reset CA L3  interrupt
-                  pthread_mutex_unlock(&r77_lock);
                   CA1_IS_req_L3 = OFF;
                   work_done++;   /* the channel's request was serviced */
                   CA1_DS_req_L3 = OFF;
                   work_done++;   /* the channel's request was serviced */
+                  pthread_mutex_unlock(&r77_lock);
                }
                if (Eregs_Out[0x57] & 0x0020) { // Reset CA L1 interrupt
                   Eregs_Inp[0x76] &= ~0x0400;  // Reset CA L1  interrupt
@@ -2587,17 +2622,17 @@ while (reason == 0) {                          /* Loop until halted */
                if (Eregs_Out[0x62] & 0x0400) { // Reset CA1 L3 interrupts
                   pthread_mutex_lock(&r77_lock);
                   Eregs_Inp[0x77] &= ~0x0008;  // Reset L3 initial selection
-                  pthread_mutex_unlock(&r77_lock);
                   CA1_IS_req_L3 = OFF;
                   work_done++;   /* the channel's request was serviced */
+                  pthread_mutex_unlock(&r77_lock);
                   Eregs_Inp[0x60] &= ~0x8200;  // Reset NSC status bits
                }
                if (Eregs_Out[0x62] & 0x0200) { // Reset CA1 L3 data service
                   pthread_mutex_lock(&r77_lock);
                   Eregs_Inp[0x77] &= ~0x0010;  // Reset L3 data service
-                  pthread_mutex_unlock(&r77_lock);
                   CA1_DS_req_L3 = OFF;
                   work_done++;   /* the channel's request was serviced */
+                  pthread_mutex_unlock(&r77_lock);
                }
                if (Eregs_Out[0x62] & 0x1000)
                   Eregs_Inp[0x62] |= 0x1000;   // Set NSC Channel end

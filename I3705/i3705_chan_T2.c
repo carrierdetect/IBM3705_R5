@@ -144,6 +144,8 @@ pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 // Declaring mutex
 extern pthread_mutex_t r77_lock;
+extern pthread_mutex_t r55_lock;   /* see i3705_cpu.c: X'55' is RMW'd here and
+                                      stored whole by the processor thread */
 
 
 void exec_attn();
@@ -599,11 +601,13 @@ void exec_attn() {
    Eregs_Inp[0x55] |= 0x0200;                        // Set Attention Request
    pthread_mutex_lock(&r77_lock);
    Eregs_Inp[0x77] |= iobs[j]->CA_mask;              // Set CA1 L3 Interrupt Request
-   pthread_mutex_unlock(&r77_lock);
    CA1_IS_req_L3 = ON;
+   pthread_mutex_unlock(&r77_lock);
    while (Ireg_bit(0x77, iobs[j]->CA_mask) == ON)
       wait();
+   pthread_mutex_lock(&r55_lock);
    Eregs_Out[0x55] &= ~0x0200;                       // Reset attention request
+   pthread_mutex_unlock(&r55_lock);
    print_regs(iobs[j], "ATTN");
    carnstat = (carnstat &0x00) | CSW_ATTN;           // Set ATTN CA return status
    //carnstat = ((Eregs_Out[0x54] >> 8 ) & 0x00FF);  // Get CA return status
@@ -633,11 +637,13 @@ void exec_pci() {
       while (Ireg_bit(0x77, iobs[j]->CA_mask) == ON)
          wait();
       Eregs_Inp[0x55] |= 0x0800;                     // Set Program Requested L3 interrupt
+      pthread_mutex_lock(&r55_lock);
       Eregs_Out[0x55] |= 0x3000;                     // Set INCWAR and OUTCWAR valid for IPL
+      pthread_mutex_unlock(&r55_lock);
       pthread_mutex_lock(&r77_lock);
       Eregs_Inp[0x77] |= iobs[j]->CA_mask;           // Set CA L3 interrupt request
-      pthread_mutex_unlock(&r77_lock);
       CA1_IS_req_L3 = ON;
+      pthread_mutex_unlock(&r77_lock);
       if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
          fprintf(A_trace, "CA%c: Requested L3 interrupt\n\r", iobs[j]->CA_id);
       while (Ireg_bit(0x77, iobs[j]->CA_mask) == ON) wait();
@@ -1219,8 +1225,8 @@ void exec_ccw(struct IO3705 *iob) {
                         wait();                          // Wait for CA1 L3 interrupt reset
                      pthread_mutex_lock(&r77_lock);
                      Eregs_Inp[0x77] |= iob->CA_mask;    // Set CA1 L3 interrupt
-                     pthread_mutex_unlock(&r77_lock);
                      CA1_IS_req_L3 = ON;                 // Chan Adap Initial Sel request flag
+                     pthread_mutex_unlock(&r77_lock);
                      while (Ireg_bit(0x77, 0x008) == ON)
                         wait();                          // Wait for initial selection reset
                   }
@@ -1242,8 +1248,8 @@ void exec_ccw(struct IO3705 *iob) {
                   wait();                                // Wait for CA1 L3 interrupt reset
                pthread_mutex_lock(&r77_lock);
                Eregs_Inp[0x77] |= iob->CA_mask;          // Set CA1  L3 interrupt
-               pthread_mutex_unlock(&r77_lock);
                CA1_IS_req_L3 = ON;                       // Chan Adap Initial Sel request flag
+               pthread_mutex_unlock(&r77_lock);
                while (Ireg_bit(0x77, 0x008) == ON)
                   wait();                                // Wait for initial selection reset
             }
@@ -1347,13 +1353,15 @@ void exec_ccw(struct IO3705 *iob) {
                case 0x05:
                   Eregs_Inp[0x5C] |= 0x0001;             // Set CA Command Register
                   Eregs_Inp[0x55] |= 0x0100;             // Set Channel Active
+                  pthread_mutex_lock(&r55_lock);
                   Eregs_Out[0x55] |= 0x3000;             // Set INCWAR and OUTCWAR valid for IPL (MAXIROS doesn't do this)
+                  pthread_mutex_unlock(&r55_lock);
                   while (Ireg_bit(0x77, iob->CA_mask) == ON)
                       wait();                            // Wait for CA1 L3 request reset
                   pthread_mutex_lock(&r77_lock);
                   Eregs_Inp[0x77] |= iob->CA_mask;       // Set CA1 L3 interrupt request
-                  pthread_mutex_unlock(&r77_lock);
                   CA1_IS_req_L3 = ON;
+                  pthread_mutex_unlock(&r77_lock);
                   break;
                case 0x09:
                   Eregs_Inp[0x55] |= 0x0100;             // Set Channel Active
@@ -1418,8 +1426,10 @@ void exec_ccw(struct IO3705 *iob) {
                   incwar = Eregs_Out[0x50];
                   cacw1 = (M[incwar] << 8) | M[incwar+1] & 0x00FF;  // Get first half of CA Control word
                   if ((cacw1 & 0x1000) == 0x0000) {      // If chain bit is off...
+                     pthread_mutex_lock(&r55_lock);
                      Eregs_Inp[0x55] &= ~0x2000;         // ...reset INCWAR valid latch...
                      Eregs_Out[0x55] &= ~0x2000;         // ...in both IN and OUT reg
+                     pthread_mutex_unlock(&r55_lock);
                   }
                   if (cacw1 & 0x2000)                    // If zero override bit is on...
                      Eregs_Inp[0x55] |= 0x4000;          // ...set zero override register flag
@@ -1463,8 +1473,8 @@ void exec_ccw(struct IO3705 *iob) {
                         condition = 0;
                         pthread_mutex_lock(&r77_lock);
                         Eregs_Inp[0x77] |= iob->CA_mask; // Set CA1 L3 interrupt request
-                        pthread_mutex_unlock(&r77_lock);
                         CA1_IS_req_L3 = ON;              // Chan Adap L3 request flag
+                        pthread_mutex_unlock(&r77_lock);
                         while (Ireg_bit(0x77, iob->CA_mask) == ON)
                            wait();
                      } // End Zero override on
@@ -1512,8 +1522,8 @@ void exec_ccw(struct IO3705 *iob) {
 
             pthread_mutex_lock(&r77_lock);
             Eregs_Inp[0x77] |= iob->CA_mask;             // Set CA1 L3 interrupt request
-            pthread_mutex_unlock(&r77_lock);
             CA1_IS_req_L3 = ON;
+            pthread_mutex_unlock(&r77_lock);
             while (Ireg_bit(0x77, iob->CA_mask) == ON)
                wait();                                   // Wait for CA1 L3 Request reset
             print_regs(iob, "CCW 05, 09, 01 Post");
@@ -1543,8 +1553,8 @@ void exec_ccw(struct IO3705 *iob) {
                wait();                                   // Wait for CA1 L3 interrupt request reset
             pthread_mutex_lock(&r77_lock);
             Eregs_Inp[0x77] |= iob->CA_mask;             // Set CA1 L3 interrupt request
-            pthread_mutex_unlock(&r77_lock);
             CA1_IS_req_L3 = ON;                          // Chan Adap L3 interrupt request flag
+            pthread_mutex_unlock(&r77_lock);
             while (Ireg_bit(0x77, iob->CA_mask) == ON)
                wait();                                   // Wait for L3 iterrupt request reset
             print_regs(iob, "CCW's 31, 32, etc");
