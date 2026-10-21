@@ -134,12 +134,12 @@ extern int16 L2Spin;            /* deposit L2SPIN 0 to restore sleeps */
    SITS in is the question a turnaround stall asks, and a full PCF trace
    is far too loud to answer it during a load. */
 extern volatile unsigned long timer_ticks;   /* should be 10/s: the 3705's 100 ms timer */
-volatile unsigned long pcf_hist[2][16];
+volatile unsigned long pcf_hist[MAX_LINES][16];
 /* Dwell: how long ONE stay in a state lasts, not how many cycles sit in it.
    A line parked for 1.5 s and a line flicking through the same state a
    thousand times look identical in the occupancy histogram above. */
-volatile unsigned long long pcf_tsc[2][16];
-volatile unsigned long      pcf_ent[2][16];
+volatile unsigned long long pcf_tsc[MAX_LINES][16];
+volatile unsigned long      pcf_ent[MAX_LINES][16];
 extern void genode_pace_us(unsigned us);  /* Timer session, microseconds */
 
 /* TWCOUNT: how many TIMED WAITS each thread performs per second. Inspection
@@ -556,10 +556,22 @@ void *CS2_thread(void *arg) {
          }
 
 
-         if (line < 2) {
+         /*
+          * EVERY CONFIGURED LINE, not the first two. These three arrays
+          * and the print loop below were dimensioned [2][16] with a
+          * `line < 2` guard, so the BSC line -- index 3, the one that
+          * carries the cluster controller whose activation is worth 5.5%
+          * of this scanner's rate -- reported nothing at all. Every PCF
+          * figure in port/results/scanner-body-slowdown.txt is line 20's
+          * for that reason, and the 30us per cycle that separates the two
+          * line regimes had to be attributed to line 23 by subtraction.
+          * MAX_LINES is 4 and a 3705-II has four line sets, so this is
+          * the whole of what the hardware can have.
+          */
+         if (line < MAX_LINES) {
             unsigned const st = icw_pcf[line] & 0xF;
-            static unsigned long long ent_t0[2];
-            static unsigned          ent_st[2] = { 16, 16 };
+            static unsigned long long ent_t0[MAX_LINES];
+            static unsigned          ent_st[MAX_LINES] = { 16, 16, 16, 16 };
             unsigned long long const nowp = sp_tsc();
             pcf_hist[line][st]++;
             if (ent_st[line] != st) {
@@ -1198,7 +1210,7 @@ void *CS2_thread(void *arg) {
                      }
                   }
                   }
-                  for (int ln = 0; ln < 2; ln++) {
+                  for (int ln = 0; ln < MAX_LINES; ln++) {
                      unsigned long tot = 0;
                      for (int q = 0; q < 16; q++) tot += pcf_hist[ln][q];
                      if (!tot) continue;
