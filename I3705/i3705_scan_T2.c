@@ -570,15 +570,23 @@ void *CS2_thread(void *arg) {
           */
          /*
           * LINES 2 AND UP ARE BEHIND DEBUGS 0x10, and that is not
-          * caution -- it is measured. Reporting two more lines means two
-          * more PCF and two more DWELL lines in every 500-cycle report,
-          * about 100 bytes, and on the port they go to a LOG that is
-          * written synchronously down a 115200 baud serial console: some
-          * 9 ms per report, amortised over 500 cycles, which is ~22 us a
-          * cycle or about 4.5% of the scanner rate. That is what the
-          * first version of this cost, and it was visible as a 6% drift
-          * against figures taken four days earlier (ms01a, 2026-10-21,
-          * body 86.7 us against 64.4 for the same line states).
+          * caution, and the figure is smaller than the first version of
+          * this comment claimed. Two more lines mean two more PCF and two
+          * more DWELL lines in every 500-cycle report, about 100 bytes,
+          * and on the Genode port those go to a LOG written synchronously
+          * down a 115200 baud serial console.
+          *
+          * MEASURED, both ways round, on ms01a 2026-10-21/22: the same
+          * line state reads body 132.2 and 132.3 us with four lines
+          * reported and 130.4 us with two -- about 2 us a cycle, 0.15% of
+          * the scanner rate. The first version of this comment attributed
+          * a 6% drift against four-day-old figures to it, which was wrong:
+          * a cell with the default report shows the same 1466/s, so the
+          * drift is something else and is still open.
+          *
+          * The gate stays. 0.15% is cheap but it is not free, and an
+          * instrument that costs anything should be asked for rather than
+          * assumed -- which is also why the number is now in this comment.
           *
           * So the default is exactly what it was -- lines 0 and 1 -- and
           * a measurement that wants the BSC line asks for it with
