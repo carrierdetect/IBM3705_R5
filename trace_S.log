@@ -1,0 +1,11 @@
+     ****** 3705 SCANNER log file ******
+     ******   Date: 16/10/2026    ******
+     sim> d debugS 01 - spare 
+                   02 - trace scanner activities [scan_T2.c]
+                   04 - trace line I/O buffers [lib.c]
+
+     All trace lines are prefixed with: #xxLny 
+        xx = 02 scanner activity
+             04 Line I/O buffer content
+        Ln = Line number n = 0 -> 9         y  = '>' Tx/request; '<' Rx/response 
+

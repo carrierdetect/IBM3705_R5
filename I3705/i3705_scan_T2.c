@@ -568,7 +568,24 @@ void *CS2_thread(void *arg) {
           * MAX_LINES is 4 and a 3705-II has four line sets, so this is
           * the whole of what the hardware can have.
           */
-         if (line < MAX_LINES) {
+         /*
+          * LINES 2 AND UP ARE BEHIND DEBUGS 0x10, and that is not
+          * caution -- it is measured. Reporting two more lines means two
+          * more PCF and two more DWELL lines in every 500-cycle report,
+          * about 100 bytes, and on the port they go to a LOG that is
+          * written synchronously down a 115200 baud serial console: some
+          * 9 ms per report, amortised over 500 cycles, which is ~22 us a
+          * cycle or about 4.5% of the scanner rate. That is what the
+          * first version of this cost, and it was visible as a 6% drift
+          * against figures taken four days earlier (ms01a, 2026-10-21,
+          * body 86.7 us against 64.4 for the same line states).
+          *
+          * So the default is exactly what it was -- lines 0 and 1 -- and
+          * a measurement that wants the BSC line asks for it with
+          * `deposit DEBUGS 18`. An instrument that changes what it
+          * measures has to be opt-in; this one was briefly not.
+          */
+         if (line < ((Sdbg_reg & 0x10) ? MAX_LINES : 2)) {
             unsigned const st = icw_pcf[line] & 0xF;
             static unsigned long long ent_t0[MAX_LINES];
             static unsigned          ent_st[MAX_LINES] = { 16, 16, 16, 16 };
@@ -1210,7 +1227,7 @@ void *CS2_thread(void *arg) {
                      }
                   }
                   }
-                  for (int ln = 0; ln < MAX_LINES; ln++) {
+                  for (int ln = 0; ln < ((Sdbg_reg & 0x10) ? MAX_LINES : 2); ln++) {
                      unsigned long tot = 0;
                      for (int q = 0; q < 16; q++) tot += pcf_hist[ln][q];
                      if (!tot) continue;
