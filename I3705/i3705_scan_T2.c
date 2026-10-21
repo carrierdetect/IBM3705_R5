@@ -115,6 +115,10 @@
 
 #include "i3705_sdlc.h"
 
+#if defined(__GENODE__)
+#include "genode_trc.h"
+#endif
+
 /* SCANPERF: is the 12 ms cycle wakeup latency, or work?
    Every previous measurement inferred it from the cycle RATE. This brackets
    the pacing sleep and the rest of the cycle separately with rdtsc -- a
@@ -437,7 +441,24 @@ void *CS2_thread(void *arg) {
    //  Scanner debug trace facility
    // ********************************************************************
    if (Sdbg_flag == OFF) {
-      S_trace = fopen("trace_S.log", "w");
+      S_trace = NULL;
+#if defined(__GENODE__)
+      /*
+       * THE TELEMETRY BUS FIRST. This port has no writable filesystem
+       * on the machine, so the fopen below cannot succeed, and the
+       * fallbacks underneath it send the trace to the Genode LOG --
+       * shared, synchronous and truncated at 267 characters -- or to
+       * /dev/null. genode_trc_open returns a line-buffered stream whose
+       * writes land in a bounded ring in this component and leave it on
+       * a crosslink, so nothing the emulator does waits on a consumer.
+       * NULL means no trace destination was configured, and the
+       * fallbacks below still apply. See genode_trc.h and
+       * docs/trace-facilities.md in the port.
+       */
+      S_trace = genode_trc_open("trace_S.log");
+#endif
+      if (S_trace == NULL)
+         S_trace = fopen("trace_S.log", "w");
 #if defined(__GENODE__)
       /*
        * The trace files are relative paths, so they land at the VFS root,

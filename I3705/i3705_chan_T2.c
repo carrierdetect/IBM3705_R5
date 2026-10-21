@@ -35,6 +35,10 @@ extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
 #endif
 extern volatile unsigned long tw_count[8];
 #include "i3705_defs.h"
+
+#if defined(__GENODE__)
+#include "genode_trc.h"
+#endif
 #if defined(__GENODE__)
 /* Genode has no SYS_gettid and the number is only ever printed. pthread_self
    is a pointer here, so it is cast rather than formatted as one. */
@@ -725,7 +729,24 @@ void *CA_T2_thread(void *arg) {
    // Channel Adapter debug trace facility
    // ********************************************************************
    if (Adbg_flag == OFF) {
-      A_trace = fopen("trace_A.log", "w");
+      A_trace = NULL;
+#if defined(__GENODE__)
+      /*
+       * THE TELEMETRY BUS FIRST. This port has no writable filesystem
+       * on the machine, so the fopen below cannot succeed, and the
+       * fallbacks underneath it send the trace to the Genode LOG --
+       * shared, synchronous and truncated at 267 characters -- or to
+       * /dev/null. genode_trc_open returns a line-buffered stream whose
+       * writes land in a bounded ring in this component and leave it on
+       * a crosslink, so nothing the emulator does waits on a consumer.
+       * NULL means no trace destination was configured, and the
+       * fallbacks below still apply. See genode_trc.h and
+       * docs/trace-facilities.md in the port.
+       */
+      A_trace = genode_trc_open("trace_A.log");
+#endif
+      if (A_trace == NULL)
+         A_trace = fopen("trace_A.log", "w");
 #if defined(__GENODE__)
       /*
        * The trace files are relative paths, so they land at the VFS root,

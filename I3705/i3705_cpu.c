@@ -236,6 +236,10 @@ volatile unsigned long l3_why[5];   /* inter, timer, pci, CA1_DS, CA1_IS */
  */
 volatile unsigned long x55_img[3];
 #include "i3705_defs.h"
+
+#if defined(__GENODE__)
+#include "genode_trc.h"
+#endif
 #include "i3705_Eregs.h"                                /* Exernal regs defs */
 #include <sys/time.h>
 #include <time.h>
@@ -740,7 +744,24 @@ while (reason == 0) {                          /* Loop until halted */
 //  Debug trace facility
 //********************************************************
    if (debug_flag == OFF) {
-      trace = fopen("trace.log", "w");
+      trace = NULL;
+#if defined(__GENODE__)
+      /*
+       * THE TELEMETRY BUS FIRST. This port has no writable filesystem
+       * on the machine, so the fopen below cannot succeed, and the
+       * fallbacks underneath it send the trace to the Genode LOG --
+       * shared, synchronous and truncated at 267 characters -- or to
+       * /dev/null. genode_trc_open returns a line-buffered stream whose
+       * writes land in a bounded ring in this component and leave it on
+       * a crosslink, so nothing the emulator does waits on a consumer.
+       * NULL means no trace destination was configured, and the
+       * fallbacks below still apply. See genode_trc.h and
+       * docs/trace-facilities.md in the port.
+       */
+      trace = genode_trc_open("trace.log");
+#endif
+      if (trace == NULL)
+         trace = fopen("trace.log", "w");
 #if defined(__GENODE__)
       /* See i3705_chan_T2.c: a relative path at a read-only VFS root gives
          NULL, and the next fprintf is a null dereference. */
