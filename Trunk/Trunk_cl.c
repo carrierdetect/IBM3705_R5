@@ -60,6 +60,10 @@
  */
 #include "genode_trunk.h"
 #include "genode_xlink.h"
+
+#if defined(__GENODE__)
+#include "genode_trc.h"
+#endif
 #endif
 #include <sys/syscall.h>
 #include <netinet/in.h>
@@ -261,7 +265,21 @@ void main(int argc, char *argv[]) {
    // Null modem debug trace facility
    //********************************************************************
    if (Tdbg_flag == ON) {
-      T_trace = fopen("trace_Trunk.log", "w");
+      T_trace = NULL;
+#if defined(__GENODE__)
+      /*
+       * THE TELEMETRY BUS FIRST, exactly as in i3705_scan_T2.c. The relay
+       * is a separate component from the 3705 but it writes the same kind
+       * of trace and has the same nowhere to put it, so it shares the
+       * rings and the drain thread -- genode_trc.c is in the port's xlink
+       * directory for that reason, beside the crosslink transport both
+       * components already share. NULL means no trace destination was
+       * configured and the fallbacks below still apply.
+       */
+      T_trace = genode_trc_open("trace_Trunk.log");
+#endif
+      if (T_trace == NULL)
+         T_trace = fopen("trace_Trunk.log", "w");
 #if defined(__GENODE__)
       /*
        * Same trap as the scanner's trace (see i3705_scan_T2.c): the path is
