@@ -119,6 +119,28 @@
 #include "genode_trc.h"
 #endif
 
+/* SP_CR: the leading carriage return these instrument lines start with.
+ *
+ * It exists for a SIMH console, where the cursor sits part-way along a line
+ * the simulator has just written and a report wants to begin at the left
+ * margin. On Genode the same text goes to the system LOG, which is
+ * line-based and prefixes every message with the component that wrote it --
+ * and the capture pipeline ends a line on a carriage return as well. So the
+ * return split each report in two: "[init -> 3705a]" alone on one line, and
+ * the numbers on the next with nothing to say whose they were. With a trunk
+ * PAIR that is not cosmetic: two controllers' reports interleave in one log
+ * and 2,252 of them in cell trunktelem3 could only be attributed by pairing
+ * each with the stranded prefix above it.
+ *
+ * Platform support, inert elsewhere: off Genode this is the "\r" it always
+ * was.
+ */
+#if defined(__GENODE__)
+#define SP_CR ""
+#else
+#define SP_CR "\r"
+#endif
+
 /* SCANPERF: is the 12 ms cycle wakeup latency, or work?
    Every previous measurement inferred it from the cycle RATE. This brackets
    the pacing sleep and the rest of the cycle separately with rdtsc -- a
@@ -184,7 +206,7 @@ static void sp_calibrate(void) {
       + (uint64_t)(c1.tv_nsec / 1000) - (uint64_t)(c0.tv_nsec / 1000);
    sp_tsc_per_us = us ? (t1 - t0) / us : 0;
    if (sp_tsc_per_us < 100) sp_tsc_per_us = 100;
-   printf("\rSCANPERF: calibrated %llu tsc/us over %llu us\n",
+   printf(SP_CR "SCANPERF: calibrated %llu tsc/us over %llu us\n",
           (unsigned long long)sp_tsc_per_us, (unsigned long long)us);
 }
 /* The TSC rate in MHz, for every figure in this file that is quoted per
@@ -209,7 +231,7 @@ static double sp_tsc_mhz(void) {
 static void sp_sleep_curve(void) {
    static const unsigned req[] = { 100, 500, 1000, 5000, 10000, 50000 };
    unsigned i;
-   printf("\rSLEEPCURVE: requested -> actual (us)\n");
+   printf(SP_CR "SLEEPCURVE: requested -> actual (us)\n");
    {  /* libc vs the Timer session, in THIS component, same thread */
       int q;
       for (q = 0; q < 3; q++) {
@@ -223,7 +245,7 @@ static void sp_sleep_curve(void) {
          genode_pace_us(500);
          clock_gettime(CLOCK_MONOTONIC, &y);
          tus = (long long)(y.tv_sec-x.tv_sec)*1000000LL + (y.tv_nsec-x.tv_nsec)/1000;
-         printf("\rPACECMP: libc %lld us   timer %lld us\n", lus, tus);
+         printf(SP_CR "PACECMP: libc %lld us   timer %lld us\n", lus, tus);
       }
    }
    for (i = 0; i < sizeof(req)/sizeof(req[0]); i++) {
@@ -234,7 +256,7 @@ static void sp_sleep_curve(void) {
       clock_gettime(CLOCK_MONOTONIC, &b);
       us = (long long)(b.tv_sec - a.tv_sec) * 1000000LL
          + (b.tv_nsec - a.tv_nsec) / 1000;
-      printf("\rSLEEPCURVE: %6u -> %8lld   overrun %+lld\n",
+      printf(SP_CR "SLEEPCURVE: %6u -> %8lld   overrun %+lld\n",
              req[i], us, us - (long long)req[i]);
    }
 }
@@ -1202,16 +1224,16 @@ void *CS2_thread(void *arg) {
                   uint64_t const nowt = sp_tsc();
                   if (tw_last) {
                      double const secs = (double)(nowt - tw_last) / (sp_tsc_mhz() * 1000000.0);
-                     printf("\rTWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
+                     printf(SP_CR "TWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
                             tw_count[0]/secs, tw_count[1]/secs, tw_count[2]/secs,
                             tw_count[3]/secs, tw_count[4]/secs, tw_count[5]/secs,
                             tw_count[6]/secs, tw_count[7]/secs,
                             l2wait[0]/secs, l2wait[1]/secs, l2wait[2]/secs,
                             lvl_hist[0]/secs, lvl_hist[1]/secs, lvl_hist[2]/secs,
                             lvl_hist[3]/secs, lvl_hist[4]/secs, lvl_hist[5]/secs);
-                  printf("\rTICKS: %.1f/s (100ms timer, want 10.0)\n", timer_ticks/secs);
+                  printf(SP_CR "TICKS: %.1f/s (100ms timer, want 10.0)\n", timer_ticks/secs);
                   timer_ticks = 0;
-                  printf("\rL3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
+                  printf(SP_CR "L3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
                          l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
                          l3_why[3]/secs, l3_why[4]/secs);
                   for (int z = 0; z < 5; z++) l3_why[z] = 0;
@@ -1229,7 +1251,7 @@ void *CS2_thread(void *arg) {
                      if (x55_img[0] != x55_seen[0] ||
                          x55_img[1] != x55_seen[1] ||
                          x55_img[2] != x55_seen[2]) {
-                        printf("\rX55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
+                        printf(SP_CR "X55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
                                x55_img[0], x55_img[1], x55_img[2]);
                         for (int z = 0; z < 3; z++) x55_seen[z] = x55_img[z];
                      }
@@ -1239,12 +1261,12 @@ void *CS2_thread(void *arg) {
                      unsigned long tot = 0;
                      for (int q = 0; q < 16; q++) tot += pcf_hist[ln][q];
                      if (!tot) continue;
-                     printf("\rPCF%d:", ln);
+                     printf(SP_CR "PCF%d:", ln);
                      for (int q = 0; q < 16; q++)
                         if (pcf_hist[ln][q])
                            printf(" %X=%.0f%%", q, 100.0*pcf_hist[ln][q]/tot);
                      printf("  (%lu cycles)\n", tot);
-                     printf("\rDWELL%d:", ln);
+                     printf(SP_CR "DWELL%d:", ln);
                      for (int q = 0; q < 16; q++)
                         if (pcf_ent[ln][q])
                            printf(" %X=%.0fus/%lu", q,
@@ -1254,7 +1276,7 @@ void *CS2_thread(void *arg) {
                      for (int q = 0; q < 16; q++) { pcf_tsc[ln][q]=0; pcf_ent[ln][q]=0; }
                      for (int q = 0; q < 16; q++) pcf_hist[ln][q] = 0;
                   }
-                  printf("\rLVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
+                  printf(SP_CR "LVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
                          lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/sp_tsc_mhz() : 0.0,
                          lvl_hist[1] ? lvl_tsc[1]/(double)lvl_hist[1]/sp_tsc_mhz() : 0.0,
                          lvl_hist[2] ? lvl_tsc[2]/(double)lvl_hist[2]/sp_tsc_mhz() : 0.0,
@@ -1271,7 +1293,7 @@ void *CS2_thread(void *arg) {
                   for (int z = 0; z < 6; z++) lvl_hist[z] = 0;
                }
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
-                  printf("\rSCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
+                  printf(SP_CR "SCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
                          (unsigned long long)sp_cycles,
                          (unsigned long long)(sp_sleep / sp_cycles),
                          (unsigned long long)(sp_body  / sp_cycles),
