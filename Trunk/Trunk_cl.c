@@ -265,6 +265,9 @@ void main(int argc, char *argv[]) {
    // Null modem debug trace facility
    //********************************************************************
    if (Tdbg_flag == ON) {
+#if defined(__GENODE__)
+      int t_on_bus = 0;        /* the telemetry stream took it, not a file */
+#endif
       T_trace = NULL;
 #if defined(__GENODE__)
       /*
@@ -277,6 +280,7 @@ void main(int argc, char *argv[]) {
        * configured and the fallbacks below still apply.
        */
       T_trace = genode_trc_open("trace_Trunk.log");
+      t_on_bus = (T_trace != NULL);
 #endif
       if (T_trace == NULL)
          T_trace = fopen("trace_Trunk.log", "w");
@@ -300,8 +304,29 @@ void main(int argc, char *argv[]) {
        * link that is nearly silent produces -- never fills the 4K
        * buffer and never appears at all. "No trace output" then reads
        * as "nothing was forwarded" when it may mean "not flushed yet".
+       *
+       * BUT NOT WHEN THE TELEMETRY STREAM TOOK IT. That reason is about a
+       * buffer nobody flushes; genode_trc_open returns a LINE buffered
+       * stream whose ring is drained by a separate thread, so a line leaves
+       * this component as soon as it is complete and nothing waits on a
+       * buffer filling. Making it unbuffered there only multiplies the
+       * writes: with __SNBF set, FreeBSD's libc calls the stream's write
+       * function once per iovec entry and vfprintf flushes every NIOV = 8
+       * of them, and this file's trace lines are frame hex dumps built a
+       * byte at a time.
+       *
+       * MEASURED, 2026-10-24: 193,956 calls into the ring for 1,619 trace
+       * lines -- ONE HUNDRED AND TWENTY A LINE -- which is 28% of a 3705's
+       * call count for 0.5% of its lines. It cost NOTHING measurable on a
+       * timed load, so this is tidiness rather than a saving and is recorded
+       * as that. The equivalent override on the scanner's trace was guarded
+       * for the same reason.
        */
-      if (T_trace != NULL)
+      if (T_trace != NULL
+#if defined(__GENODE__)
+          && !t_on_bus
+#endif
+         )
          setvbuf(T_trace, NULL, _IONBF, 0);
 #endif
       time_t tme = time(NULL);
