@@ -530,7 +530,42 @@ void *CS2_thread(void *arg) {
        * never. The controllers' traces call fflush after every write; this
        * one does not, so the buffering is turned off once instead.
        */
+#if !defined(__GENODE__)
       setvbuf(S_trace, NULL, _IONBF, 0);
+#else
+      /*
+       * NOT ON GENODE, AND IT COSTS EIGHT WRITES A LINE THERE. On that
+       * platform S_trace is not a file: genode_trc_open() returns a funopen
+       * stream whose write callback copies into a bounded ring inside this
+       * component, and a separate drain thread empties the ring onto a
+       * crosslink. So the reason for the override does not apply -- nothing
+       * is waiting for this process to exit before the text can be read,
+       * and the ring IS the buffer -- while the override's cost is paid on
+       * the scanner's own thread:
+       *
+       *   * FreeBSD's libc, which that platform uses, flushes vfprintf's
+       *     accumulated iovec every NIOV entries, and NIOV is 8
+       *     (lib/libc/stdio/printfcommon.h). One entry per literal or
+       *     conversion segment of the format.
+       *   * With __SNBF set, __sfvwrite() calls the stream's write function
+       *     ONCE PER IOVEC ENTRY (lib/libc/stdio/fvwrite.c).
+       *   * The fast path that would coalesce an unbuffered fprintf into a
+       *     single write, __sbprintf(), is gated on fp->_file >= 0
+       *     (lib/libc/stdio/vfprintf.c) -- and funopen() sets _file to -1,
+       *     so a funopen stream never takes it.
+       *
+       * MEASURED on a remote network control program load across a pair of
+       * 3705s, 2026-10-24: 335,855 scanner trace lines against 2,679,800
+       * calls to the ring, which is 7.98 per line. The channel adapter's
+       * trace, on the same emulator in the same boot and left
+       * line-buffered, ran at 1.04. Each of those calls takes a mutex,
+       * signals a condition variable and copies the bytes, and the trace
+       * path as a whole cost 36 seconds of a 323 second load.
+       *
+       * genode_trc_open() has already set _IOLBF -- one call per line --
+       * so the right thing here is to leave its choice alone.
+       */
+#endif
       Sdbg_flag = ON;
       /* Calibrate the TSC now if the TWCOUNT/s report is wanted, so the
          100 ms it costs is spent before the scanner loop starts rather
