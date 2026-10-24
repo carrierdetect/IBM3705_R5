@@ -141,6 +141,44 @@
 #define SP_CR "\r"
 #endif
 
+/*
+ * WHERE THE PER-REPORT INSTRUMENTS GO, and on Genode it is not stdout.
+ *
+ * The TWCOUNT/TICKS/L3WHY/PCF/DWELL/LVLUS/SCANPERF block below reports once
+ * every 500 scanner cycles. On a SIMH console that is a console line and
+ * belongs on stdout. On Genode stdout is the shared LOG, which leaves the
+ * machine over a 115200 baud serial line at 11,520 bytes a second -- and
+ * these reports are the single largest thing on it:
+ *
+ *   MEASURED on a remote NCP load across a pair of 3705s, 2026-10-24:
+ *   13,632 lines and 1,106,305 bytes inside one measured window, which is
+ *   96 seconds of serial time. A single-deposit A/B -- DEBUGS 0x0A against
+ *   0x02, the only pair in that series that moves one bit -- priced them at
+ *   40 SECONDS of a 399 second load.
+ *
+ * So on that platform they go to S_trace, which is the scanner's own trace
+ * destination and is a telemetry stream there rather than a file: a bounded
+ * ring in the component, drained by a separate thread onto a crosslink, at a
+ * measured 3.4% of the load for the whole facility. The reports are then
+ * carried with the scanner trace they describe, which is where they would
+ * have been all along if this file had had somewhere to put them.
+ *
+ * S_trace is opened whatever the debug register holds -- only the VOLUME is
+ * gated -- so a run that asks for the reports and not the line trace still
+ * gets them. Off Genode nothing changes: SP_REPORT is printf.
+ *
+ * The start-up diagnostics above (SLEEPCURVE, PACECMP, and the one-line
+ * calibration) are deliberately NOT routed. They are a handful of lines once,
+ * they are about the platform's timers rather than about the scanner, and a
+ * console is the right place for them.
+ */
+#if defined(__GENODE__)
+#define SP_REPORT(...)                                                        \
+	do { if (S_trace) fprintf(S_trace, __VA_ARGS__); } while (0)
+#else
+#define SP_REPORT(...) printf(__VA_ARGS__)
+#endif
+
 /* SCANPERF: is the 12 ms cycle wakeup latency, or work?
    Every previous measurement inferred it from the cycle RATE. This brackets
    the pacing sleep and the rest of the cycle separately with rdtsc -- a
@@ -1259,16 +1297,16 @@ void *CS2_thread(void *arg) {
                   uint64_t const nowt = sp_tsc();
                   if (tw_last) {
                      double const secs = (double)(nowt - tw_last) / (sp_tsc_mhz() * 1000000.0);
-                     printf(SP_CR "TWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
+                     SP_REPORT(SP_CR "TWCOUNT/s: scan=%.0f pnl=%.0f cpu=%.0f ca10=%.0f ca100=%.0f lib=%.0f cawait=%.0f idle=%.0f l2w=%.0f/%.0f/%.0f lvl=%.0f/%.0f/%.0f/%.0f/%.0f/%.0f\n",
                             tw_count[0]/secs, tw_count[1]/secs, tw_count[2]/secs,
                             tw_count[3]/secs, tw_count[4]/secs, tw_count[5]/secs,
                             tw_count[6]/secs, tw_count[7]/secs,
                             l2wait[0]/secs, l2wait[1]/secs, l2wait[2]/secs,
                             lvl_hist[0]/secs, lvl_hist[1]/secs, lvl_hist[2]/secs,
                             lvl_hist[3]/secs, lvl_hist[4]/secs, lvl_hist[5]/secs);
-                  printf(SP_CR "TICKS: %.1f/s (100ms timer, want 10.0)\n", timer_ticks/secs);
+                  SP_REPORT(SP_CR "TICKS: %.1f/s (100ms timer, want 10.0)\n", timer_ticks/secs);
                   timer_ticks = 0;
-                  printf(SP_CR "L3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
+                  SP_REPORT(SP_CR "L3WHY: inter=%.0f timer=%.0f pci=%.0f caDS=%.0f caIS=%.0f per s\n",
                          l3_why[0]/secs, l3_why[1]/secs, l3_why[2]/secs,
                          l3_why[3]/secs, l3_why[4]/secs);
                   for (int z = 0; z < 5; z++) l3_why[z] = 0;
@@ -1286,7 +1324,7 @@ void *CS2_thread(void *arg) {
                      if (x55_img[0] != x55_seen[0] ||
                          x55_img[1] != x55_seen[1] ||
                          x55_img[2] != x55_seen[2]) {
-                        printf(SP_CR "X55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
+                        SP_REPORT(SP_CR "X55IMG: stores=%lu saved_outcwar=%lu saved_incwar=%lu\n",
                                x55_img[0], x55_img[1], x55_img[2]);
                         for (int z = 0; z < 3; z++) x55_seen[z] = x55_img[z];
                      }
@@ -1296,22 +1334,22 @@ void *CS2_thread(void *arg) {
                      unsigned long tot = 0;
                      for (int q = 0; q < 16; q++) tot += pcf_hist[ln][q];
                      if (!tot) continue;
-                     printf(SP_CR "PCF%d:", ln);
+                     SP_REPORT(SP_CR "PCF%d:", ln);
                      for (int q = 0; q < 16; q++)
                         if (pcf_hist[ln][q])
-                           printf(" %X=%.0f%%", q, 100.0*pcf_hist[ln][q]/tot);
-                     printf("  (%lu cycles)\n", tot);
-                     printf(SP_CR "DWELL%d:", ln);
+                           SP_REPORT(" %X=%.0f%%", q, 100.0*pcf_hist[ln][q]/tot);
+                     SP_REPORT("  (%lu cycles)\n", tot);
+                     SP_REPORT(SP_CR "DWELL%d:", ln);
                      for (int q = 0; q < 16; q++)
                         if (pcf_ent[ln][q])
-                           printf(" %X=%.0fus/%lu", q,
+                           SP_REPORT(" %X=%.0fus/%lu", q,
                                   pcf_tsc[ln][q]/(double)pcf_ent[ln][q]/sp_tsc_mhz(),
                                   pcf_ent[ln][q]);
-                     printf("\n");
+                     SP_REPORT("\n");
                      for (int q = 0; q < 16; q++) { pcf_tsc[ln][q]=0; pcf_ent[ln][q]=0; }
                      for (int q = 0; q < 16; q++) pcf_hist[ln][q] = 0;
                   }
-                  printf(SP_CR "LVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
+                  SP_REPORT(SP_CR "LVLUS: w=%.0f L1=%.0f L2=%.0f L3=%.0f L4=%.0f L5=%.0f us/pass\n",
                          lvl_hist[0] ? lvl_tsc[0]/(double)lvl_hist[0]/sp_tsc_mhz() : 0.0,
                          lvl_hist[1] ? lvl_tsc[1]/(double)lvl_hist[1]/sp_tsc_mhz() : 0.0,
                          lvl_hist[2] ? lvl_tsc[2]/(double)lvl_hist[2]/sp_tsc_mhz() : 0.0,
@@ -1328,7 +1366,7 @@ void *CS2_thread(void *arg) {
                   for (int z = 0; z < 6; z++) lvl_hist[z] = 0;
                }
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
-                  printf(SP_CR "SCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
+                  SP_REPORT(SP_CR "SCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
                          (unsigned long long)sp_cycles,
                          (unsigned long long)(sp_sleep / sp_cycles),
                          (unsigned long long)(sp_body  / sp_cycles),
