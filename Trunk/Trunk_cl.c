@@ -264,7 +264,29 @@ void main(int argc, char *argv[]) {
    //********************************************************************
    // Null modem debug trace facility
    //********************************************************************
+   /*
+    * OPEN THE STREAM EVEN WITHOUT -d, on the one platform that can arm this
+    * trace at run time.
+    *
+    * Upstream the flag does two jobs -- it opens the file and it gates every
+    * write -- and that is sound when the only way to set it is an argument on
+    * the command line. The Genode port can turn the relay's trace on from a
+    * management console's permit while the relay is running
+    * (docs/trace-facilities.md), and then the two jobs come apart: the writes
+    * below are guarded by Tdbg_flag, but T_trace would still be the NULL it
+    * was initialised to and the first armed frame would dereference it.
+    *
+    * genode_trc_configured() is true when the component was given somewhere
+    * to put a trace -- a ring drained onto the telemetry bus, not a file --
+    * so the stream is opened then, the banner is written, and Tdbg_flag goes
+    * on being the write gate and nothing else. The cost of an unarmed boot
+    * is that one banner.
+    */
+#if defined(__GENODE__)
+   if (Tdbg_flag == ON || genode_trc_configured()) {
+#else
    if (Tdbg_flag == ON) {
+#endif
 #if defined(__GENODE__)
       int t_on_bus = 0;        /* the telemetry stream took it, not a file */
 #endif
