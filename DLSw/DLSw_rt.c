@@ -284,6 +284,39 @@ int            conrfd = OFF;        /* Status of DLSw read connection        */
 int            conwfd = OFF;        /* Status of DLSw write connection       */
 int            conlfd = OFF;        /* Status of SDLC line connection        */
 
+/*
+ * WHETHER THE PEER HAS ACKNOWLEDGED OUR CAPABILITIES EXCHANGE, which is the
+ * difference between a peer that reaches CONNECT and one that does not.
+ *
+ * MEASURED against a Cisco 2522 (IOS 12.2(32), C2500-JS-L) on 2026-10-27,
+ * with "debug dlsw peers" running on the router. The exchange went:
+ *
+ *   DLSw: passive open 10.1.1.61(44448) -> 2065
+ *   DLSw: dtp_action_c() opening write pipe for peer
+ *   DLSw: END-TPFSM: state:DISCONN->WWR_RDOP
+ *   DLSw: event:SSP-CAP MSG RCVD state:WWR_RDOP
+ *   DLSw: dtp_action_h() CAN'T PROCESS CapExId UNTIL WR/RD PIPES OPEN
+ *   DLSw: dtp_action_i() write pipe opened for peer
+ *   DLSw: CapExId Msg sent to peer                 state:WWR_RDOP->WAIT_CAP
+ *   DLSw: Recv CapExPosRsp Msg from peer           state:WAIT_CAP->WAIT_CAP
+ *   DLSw: dtp_action_b() close connection for peer WAIT_CAP->DISCONN
+ *
+ * This program sent its CapExId as soon as ITS OWN two TCP halves were up,
+ * which is BEFORE the peer had finished opening its write pipe. The peer
+ * discarded it, sent its own, took our positive response -- and then sat in
+ * WAIT_CAP waiting for a CapExId that was never sent again, until a seven
+ * second timer closed both connections. Every run looked like this from the
+ * outside: a complete capabilities exchange in our own log and a peer that
+ * never came up.
+ *
+ * So the request is OFFERED UNTIL IT IS ANSWERED rather than sent once. The
+ * retry is bounded, because a peer that will never answer should say so once
+ * and not forever.
+ */
+int            capex_acked = NO;    /* peer sent 0x1521 for OUR CapExId      */
+#define CAPEX_RETRY_S    2           /* seconds between offers               */
+#define CAPEX_MAX_TRIES  5           /* then say so once and stop            */
+
 uint8_t        seq_Nr = 0;          /* SDLC frame sequence receive number    */
 uint8_t        seq_Ns = 0;          /* SDLC frame sequence send number       */
 
@@ -724,10 +757,11 @@ int proc_DLSw(unsigned char DLSw_rbuf[], int DLSwrlen, unsigned char *DLSw_wbuf)
             break;
          }
          if (GDS_id == 0x1521) {                                            // Received acceptance of Capability parameters
+            capex_acked = YES;                                              // stop offering ours; see the flag's comment
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s CAP_EXCHANGE RESPONSE\n",TimeStamp());
-               printf("\rDLSw: Received CAP_EXCHANGE RESPONSE\n");
             }
+            printf("\rDLSw: Received CAP_EXCHANGE RESPONSE\n");
             break;
          }
    } // End Switch
@@ -756,17 +790,20 @@ void main(int argc, char *argv[]) {
    int            pendingrcv;            /* pending data on the socket        */
    int            event_count;           /* # events received                 */
    char           *ipaddr;
-   struct         hostent *dlswent;
-   struct         hostent *lineent;
+   struct         hostent *hent;        /* one resolution at a time, see below */
+   struct         in_addr peer_ip;      /* the peer DLSw, copied out of it     */
+   struct         in_addr line_ip;      /* the 3705, likewise                  */
+   int            have_peer = 0, have_line = 0;
    int            peerlen;               /* size of peer ip address           */
    int            linenum = 20;          /* SDLC line number (default 20)     */
    char           *peeraddrp;
    int            capex = NO;
+   time_t         capex_sent = 0;    /* when the last CapExId went out       */
+   int            capex_tries = 0;
    int            Fptr, FptrL, frame_len; /* SDLC frame pointers and length   */
    uint8_t        Cfield;                /* SDLC Control Field work byte      */
    uint8_t        Fdx = OFF;             /* Default Half Duplex line       */
    int            i, rc, rc1, rc2;
-   char ipv4addr[sizeof(struct in_addr)];
 
    /* Read command line arguments */
    if (argc == 1) {
@@ -796,19 +833,56 @@ void main(int argc, char *argv[]) {
          i++;
          continue;
       } else if (strcmp(argv[i], "-cchn") == 0) {
-         if ( (lineent = gethostbyname(argv[i+1]) ) == NULL ) {
+         /*
+          * COPY THE ADDRESS OUT, DO NOT KEEP THE POINTER.
+          *
+          * gethostbyname() and gethostbyaddr() return a pointer to STATIC
+          * storage that the next call overwrites. This program resolves TWO
+          * hosts -- the peer DLSw and the 3705 -- and kept both pointers, so
+          * whichever argument came last defined BOTH addresses.
+          *
+          * The symptom is not a failure. With "-peerhn <router> -cchn
+          * localhost" the peer address became 127.0.0.1 and the program
+          * connected to its own listener, exchanged capabilities with itself
+          * and printed the entire happy path:
+          *
+          *   DLSw: Outbound connection to peer has been established
+          *   DLSw: Inbound connection from peer DLSw at 127.0.0.1
+          *   DLSw: CAP_EXCHANGE sent
+          *   DLSw: Received CAP_EXCHANGE RESPONSE
+          *
+          * -- a complete and convincing conversation with nobody. Reversing
+          * the two arguments does not fix it; it moves the wrong address to
+          * the 3705 instead.
+          */
+         if ( (hent = gethostbyname(argv[i+1]) ) == NULL ) {
             printf("\rDLSw: Cannot resolve 3705 hostname %s\n", argv[i+1]);
             return;                /* error */
-         }  // End if linewent
+         }  // End if hent
+         memcpy(&line_ip, hent->h_addr_list[0], sizeof(line_ip));
+         have_line = 1;
          printf("\rDLSw: Connection to be established with SLDC line at 3705 on host %s\n", argv[i+1]);
          i = i+2;
          continue;
       } else if (strcmp(argv[i], "-ccip") == 0) {
-         inet_pton(AF_INET, argv[i+1], ipv4addr);
-         if ( (lineent = gethostbyaddr(&ipv4addr, sizeof(ipv4addr), AF_INET) ) == NULL ) {
-            printf("\rDLSw: Cannot resolve ip address %s\n", argv[i+1]);
+         /*
+          * AN IP ADDRESS NEEDS NO DNS AT ALL, and this asked for MORE of it
+          * than the hostname form does: inet_pton parsed the address into
+          * ipv4addr and the result was thrown away, then gethostbyaddr() --
+          * a REVERSE lookup -- was asked to turn it back into a name. On a
+          * network with no reverse zone the documented way to avoid DNS
+          * fails with
+          *
+          *   DLSw: Cannot resolve ip address 10.1.1.66
+          *
+          * which reads as a bad address rather than a missing PTR record.
+          * The parsed address is what the socket call needs, so it is kept.
+          */
+         if (inet_pton(AF_INET, argv[i+1], &line_ip) != 1) {
+            printf("\rDLSw: %s is not an IPv4 address\n", argv[i+1]);
             return; /* error */
-         }  // End if lineent
+         }
+         have_line = 1;
          printf("\rDLSw: Connection to be established with SDLC line at 3705 on ip address %s\n", argv[i+1]);
          i = i + 2;
          continue;
@@ -818,19 +892,21 @@ void main(int argc, char *argv[]) {
          i = i + 2;
          continue;
       } else if (strcmp(argv[i], "-peerhn") == 0) {
-         if ( (dlswent = gethostbyname(argv[i+1]) ) == NULL ) {
+         if ( (hent = gethostbyname(argv[i+1]) ) == NULL ) {
             printf("\rDLSw: Cannot resolve hostname %s\n", argv[i+1]);
             return;                /* error */
-         }  // End if dlswent
+         }  // End if hent
+         memcpy(&peer_ip, hent->h_addr_list[0], sizeof(peer_ip));
+         have_peer = 1;
          printf("\rDLSw: Connection to be established with peer DLSw %s\n", argv[i+1]);
          i = i + 2;
          continue;
       } else if (strcmp(argv[i], "-peerip") == 0) {
-         inet_pton(AF_INET, argv[i+1], ipv4addr);
-         if ( (dlswent = gethostbyaddr(&ipv4addr, sizeof(ipv4addr), AF_INET) ) == NULL ) {
-            printf("\rDLSw: Cannot resolve ip address %s\n", argv[i+1]);
+         if (inet_pton(AF_INET, argv[i+1], &peer_ip) != 1) {
+            printf("\rDLSw: %s is not an IPv4 address\n", argv[i+1]);
             return; /* error */
-         }  // End if dlswent
+         }
+         have_peer = 1;
          printf("\rDLSw: Connection to be established with peer DLSw at ip address %s\n", argv[i+1]);
          i = i + 2;
          continue;
@@ -847,6 +923,19 @@ void main(int argc, char *argv[]) {
          return;
       }  // End else
    }  // End while
+
+   /*
+    * AND BOTH ADDRESSES ARE REQUIRED, which nothing checked.
+    *
+    * dlswent and lineent were uninitialised pointers dereferenced several
+    * hundred lines below, so leaving out -peerhn/-peerip -- or -cchn/-ccip --
+    * was a wild read rather than a message. The flags make it one line.
+    */
+   if (!have_peer || !have_line) {
+      printf("\rDLSw: a peer DLSw (-peerhn or -peerip) AND a 3705 (-cchn or "
+             "-ccip) are both required\n");
+      return;
+   }
 
    //********************************************************************
    // DLSw debug trace facility
@@ -913,12 +1002,12 @@ void main(int argc, char *argv[]) {
 
    // Assign IP addr and PORT number
    lineaddr.sin_family = AF_INET;
-   memcpy(&lineaddr.sin_addr, lineent->h_addr_list[0], lineent->h_length);
+   lineaddr.sin_addr = line_ip;
    lineaddr.sin_port = htons(SDLCBASE + linenum);
    if (Fdx) {
       // For Full Duplex Assign IP addr and PORT number for 2nd line
       lineaddr2.sin_family = AF_INET;
-      memcpy(&lineaddr2.sin_addr, lineent->h_addr_list[0], lineent->h_length);
+      lineaddr2.sin_addr = line_ip;
       lineaddr2.sin_port = htons(SDLCBASE+linenum+1);
    }
 
@@ -992,7 +1081,7 @@ void main(int argc, char *argv[]) {
 
    // Assign IP addr and PORT number
    peeraddr.sin_family = AF_INET;
-   memcpy(&peeraddr.sin_addr, dlswent->h_addr_list[0], dlswent->h_length);
+   peeraddr.sin_addr = peer_ip;
    peeraddr.sin_port = htons(DLSW_PORT);
    printf("\rDLSw: Waiting for DLSw peer outbound connection to be established\n");
 
@@ -1046,7 +1135,19 @@ void main(int argc, char *argv[]) {
          }  // End if rc == 0
       }  // End if conwfd == OFF
 
-      if ((conrfd == ON) && (conwfd == ON) && (capex == NO)) {
+      /*
+       * OFFER THE CAPABILITIES EXCHANGE UNTIL THE PEER ANSWERS IT.
+       *
+       * The flag capex_acked carries the reasoning and the measurement: a
+       * real DLSw+ peer discards a CapExId that arrives before its own write
+       * pipe is open, and then waits for one. Sending once was therefore a
+       * race this program lost every time against a Cisco. Two seconds
+       * apart, five attempts, which lands inside that peer's own seven
+       * second WAIT_CAP timer with room to spare.
+       */
+      if ((conrfd == ON) && (conwfd == ON) && (capex_acked == NO) &&
+          (capex_tries < CAPEX_MAX_TRIES) &&
+          ((capex == NO) || (time(NULL) - capex_sent >= CAPEX_RETRY_S))) {
          memcpy(&DLSw_wbuf, CONTROL_MSG_Hdr, sizeof(CONTROL_MSG_Hdr));
          memcpy(&DLSw_wbuf[sizeof(CONTROL_MSG_Hdr)], CAP_EXCHANGE_Msg, sizeof(CAP_EXCHANGE_Msg));
          DLSw_wbuf[HDR_MTYP] = CAP_EXCHANGE;
@@ -1063,7 +1164,12 @@ void main(int argc, char *argv[]) {
             fflush(T_trace);
          }  // End if Tdbg_lag
          capex = YES;
-      }  // End if ((conrfd == ON) && (conwfd == ON) && (capex == NO))
+         capex_sent = time(NULL);
+         capex_tries++;
+         if (capex_tries == CAPEX_MAX_TRIES)
+            printf("\rDLSw: the peer has not acknowledged our capabilities "
+                   "exchange after %d attempts\n", capex_tries);
+      }  // End if capabilities exchange still unanswered
 
       if (conrfd == ON) {
          pendingrcv = 0;
