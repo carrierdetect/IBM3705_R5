@@ -371,6 +371,44 @@ void print_state() {
 //*********************************************************************
 // Function to check if socket is (still) connected                   *
 //*********************************************************************
+/*
+ * HAS THIS SOCKET CONNECTED TO ITSELF?
+ *
+ * It can, and on a stock Linux it eventually will. The 3705's SDLC line
+ * ports are SDLCBASE + line number -- 37520 upwards -- and Linux's default
+ * ephemeral range is 32768-60999, so they are INSIDE it. A connect() to a
+ * port in that range with nothing listening is retried here in a tight loop;
+ * each attempt draws a new ephemeral source port, and when it draws the
+ * destination port itself the SYN meets its own socket, TCP's simultaneous
+ * open completes, and connect() returns 0.
+ *
+ * MEASURED 2026-10-27 with no 3705 running at all:
+ *
+ *   DLSw: SDLC line connection has been established
+ *   $ ss -tanp | grep 3752
+ *   ESTAB 127.0.0.1:37520  127.0.0.1:37520  users:(("DLSw",pid=106896,fd=3))
+ *
+ * -- so the program announced an SDLC line, had one, and the far end was
+ * itself. Everything it writes to the line it will read back, and no frame
+ * from a 3705 can ever arrive. It takes a few seconds of retries to happen,
+ * which is why it looks like a normal start-up.
+ *
+ * Operationally this is also avoidable outside the program --
+ * ip_local_reserved_ports, or an ephemeral range that clears 375xx -- and
+ * the same hazard applies to anything here that retries a connect to a
+ * 3705 line (the 3274, the 3271, Trunk).
+ */
+static bool IsSelfConnected(int sockfd) {
+   struct sockaddr_in me, peer;
+   socklen_t ml = sizeof(me), pl = sizeof(peer);
+
+   if (sockfd < 1) return false;
+   if (getsockname(sockfd, (struct sockaddr *) &me, &ml) != 0) return false;
+   if (getpeername(sockfd, (struct sockaddr *) &peer, &pl) != 0) return false;
+   return (me.sin_port == peer.sin_port) &&
+          (me.sin_addr.s_addr == peer.sin_addr.s_addr);
+}
+
 static bool IsSocketConnected(int sockfd) {
    int rc;
    struct sockaddr_in peer_addr;
@@ -1231,9 +1269,39 @@ void main(int argc, char *argv[]) {
       //  If the connection is not active yet or if the connection was lost, try to re-establish
       //*****************************************************************************************
       if (conlfd == OFF) {
-         if (!(IsSocketConnected(line_fd))) {
-            rc1 = connect(line_fd, (struct sockaddr*)&lineaddr, sizeof(lineaddr));
-         }  // End if (!(IsSocketConnected(line_fd)))
+         /*
+          * rc1 IS SET ON EVERY PASS, which it was not: the connect() was
+          * skipped when the socket was already connected and rc1 was then
+          * READ STALE -- or, on the first pass, uninitialised -- by the test
+          * below. An already-connected socket is a zero; everything else is
+          * what connect() says.
+          */
+         rc1 = IsSocketConnected(line_fd)
+             ? 0
+             : connect(line_fd, (struct sockaddr*)&lineaddr, sizeof(lineaddr));
+#if !defined(__GENODE__)
+         /*
+          * AND A CONNECTION TO OURSELVES IS NOT A CONNECTION. See
+          * IsSelfConnected(): the line ports are inside Linux's ephemeral
+          * range, so a retried connect to a 3705 that is not up eventually
+          * meets its own socket and succeeds. The socket cannot be reused
+          * after this, so it is closed and remade, and the retry carries on.
+          * Not on Genode, where the line is a crosslink and has no peer to
+          * be.
+          */
+         if ((rc1 == 0) && IsSelfConnected(line_fd)) {
+            static int said = 0;
+            if (!said) {
+               said = 1;
+               printf("\rDLSw: the SDLC line socket connected to ITSELF on "
+                      "port %d -- no 3705 is listening there. Retrying.\n",
+                      SDLCBASE + linenum);
+            }
+            close(line_fd);
+            line_fd = socket(AF_INET, SOCK_STREAM, 0);
+            rc1 = -1;
+         }
+#endif
          rc2 = 0;    // Preset to zero in cae line is Half Duplex.
          if (Fdx) {
             // Connect to the SDLC receive line socket
