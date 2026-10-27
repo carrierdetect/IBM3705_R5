@@ -768,7 +768,28 @@ void *CA_T2_thread(void *arg) {
                        );
       Adbg_flag = ON;
    }
-   Adbg_reg = 0x00;
+   /*
+    * DO NOT CLOBBER AN ARM, which is i3705_scan_T2.c's reason for the same
+    * line and this one has a second.
+    *
+    * Adbg_reg is a global and is zero at load, so the assignment that was
+    * here bought nothing even upstream: this function runs in the channel
+    * adapter's thread, which scp.c creates as its very first act, so a
+    * "deposit DEBUGA 01" from the configuration file is processed later and
+    * survived it by luck of ordering rather than by design.
+    *
+    * What does NOT survive it is an arm from outside the simulator. The
+    * Genode port can turn the channel adapter's trace on at run time from a
+    * management console's permit (docs/trace-facilities.md), and that permit
+    * may already be in force when the component starts -- an operator arms a
+    * stopped machine and then starts it. The arm is applied before the
+    * simulator thread is created; this line then ran afterwards and silently
+    * disarmed it, which looks exactly like a permit that never arrived.
+    *
+    * Initialising a global that is already zero buys nothing; leaving an arm
+    * alone buys the trace. Affects every platform, but only one of them has
+    * a way to arm this at run time today.
+    */
    pthread_t id1, id2, id3;
    args = malloc(sizeof(struct pth_args) * 1);
    /***************************************/
