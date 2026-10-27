@@ -53,6 +53,10 @@
  */
 #include <poll.h>
 #include "genode_line.h"
+/* The component's Timer-session pacing shim, used by the rest at the main
+   loop's end: i3705's genode_pace_us says why that platform's libc usleep
+   will not do. */
+extern void genode_pace_us(unsigned us);
 #include "genode_xlink.h"
 extern void genode_pace_us(unsigned us);
 #endif
@@ -398,6 +402,8 @@ void print_state() {
  * the same hazard applies to anything here that retries a connect to a
  * 3705 line (the 3274, the 3271, Trunk).
  */
+#if !defined(__GENODE__)   /* both tests are about sockets, and a line here
+                              is a crosslink -- see the connect block */
 static bool IsSelfConnected(int sockfd) {
    struct sockaddr_in me, peer;
    socklen_t ml = sizeof(me), pl = sizeof(peer);
@@ -423,6 +429,7 @@ static bool IsSocketConnected(int sockfd) {
    }
    return true;
 }
+#endif
 
 /*-------------------------------------------------------------------*/
 /* Process DLSw message                                              */
@@ -969,11 +976,24 @@ void main(int argc, char *argv[]) {
     * hundred lines below, so leaving out -peerhn/-peerip -- or -cchn/-ccip --
     * was a wild read rather than a message. The flags make it one line.
     */
+#if defined(__GENODE__)
+   /*
+    * THE LINE NEEDS NO ADDRESS HERE. It is a crosslink the component opened
+    * before this ran, so -cchn/-ccip have nothing to name and the scenario
+    * passes neither; only the peer DLSw is still a socket and still needs
+    * one.
+    */
+   if (!have_peer) {
+      printf("\rDLSw: a peer DLSw (-peerhn or -peerip) is required\n");
+      return;
+   }
+#else
    if (!have_peer || !have_line) {
       printf("\rDLSw: a peer DLSw (-peerhn or -peerip) AND a 3705 (-cchn or "
              "-ccip) are both required\n");
       return;
    }
+#endif
 
    //********************************************************************
    // DLSw debug trace facility
@@ -1031,11 +1051,27 @@ void main(int argc, char *argv[]) {
 #endif
    // If FDX create a second SDLC line socket
    if (Fdx) {
+#if defined(__GENODE__)
+      /*
+       * THE SECOND LINE IS A CROSSLINK TOO, and this was the half the port
+       * missed: line_fd above came from genode_line_fd() and the full-duplex
+       * partner was still a socket() -- on a platform where the lines are
+       * crosslinks opened before this program starts, and where the
+       * component's own default is fdx="yes". genode_line_declare(line, fdx)
+       * opened both; fd_sec() is the second.
+       */
+      line2_fd = genode_line_fd_sec();
+      if (line2_fd < 0) {
+         printf("\rDLSw: no second 3705 line for full duplex\n");
+         return;
+      }
+#else
       line2_fd = socket(AF_INET, SOCK_STREAM, 0);
       if (line2_fd <= 0) {
          printf("\rDLSw: Cannot create second line socket for Full Duplex connection\n");
          return;
       }
+#endif
    }
 
    // Assign IP addr and PORT number
@@ -1128,7 +1164,11 @@ void main(int argc, char *argv[]) {
    seq_Ns = 0;    /* Initialize SDLC frame sequence send number              */
    SDLCwlen = 0;  /* Initialize SDLC write buffer length                     */
 
+   static unsigned idle = 0;    /* consecutive passes with nothing to do */
+   int             busy;
+
    while (1) {
+      busy = 0;
       //*****************************************************************************************
       // Check if there is data to be received from the peer DLSw
       // If the connection is not active yet or if the connection was lost, try to re-establish
@@ -1238,6 +1278,7 @@ void main(int argc, char *argv[]) {
             conrfd = OFF;
          } else {
             if (pendingrcv > 0) {
+               busy = 1;             /* see the rest at the loop's end */
                DLSwrlen = read(dlsw_rfd, DLSw_rbuf, sizeof(DLSw_rbuf));
                if (Tdbg_flag == ON) {
                   fprintf(T_trace, "%s DLSw Read Buffer: ",TimeStamp());
@@ -1269,6 +1310,20 @@ void main(int argc, char *argv[]) {
       //  If the connection is not active yet or if the connection was lost, try to re-establish
       //*****************************************************************************************
       if (conlfd == OFF) {
+#if defined(__GENODE__)
+         /*
+          * A CROSSLINK IS ALREADY CONNECTED, so there is nothing to connect
+          * and nothing to retry -- and this block is what kept the Genode
+          * port of DLSw from ever working. line_fd is a VFS descriptor on a
+          * terminal_crosslink that the component opened before this function
+          * ran; connect() on it cannot succeed, so conlfd stayed OFF for
+          * ever and the 3705's line was never read. The comment on the
+          * receive path below already said the re-establish arm was
+          * unreachable here; it was reachable, and it was the only arm.
+          */
+         conlfd = ON;
+         printf("\rDLSw: SDLC line crosslink is open\n");
+#else
          /*
           * rc1 IS SET ON EVERY PASS, which it was not: the connect() was
           * skipped when the socket was already connected and rc1 was then
@@ -1312,6 +1367,7 @@ void main(int argc, char *argv[]) {
             printf("\rDLSw: SDLC line connection has been established\n");
             conlfd = ON;
          }  // End if ((rc1 == 0) && (rc2 ==0))
+#endif
       }  // End if conlfd
 
       if (conlfd == ON) {
@@ -1345,6 +1401,7 @@ void main(int argc, char *argv[]) {
          }  // End if (IsSocketConnected(line_fd))
 
          if (pendingrcv > 0) {
+            busy = 1;                /* see the rest at the loop's end */
             SDLCrlen = read(line_fd, SDLC_rbuf, sizeof(SDLC_rbuf));
             if (Tdbg_flag == ON) {
                fprintf(T_trace, "%s SDLC Read Buffer: ",TimeStamp());
@@ -1557,6 +1614,38 @@ void main(int argc, char *argv[]) {
             }  // End if (Fptr <= SDLCrlen-6)
          }  // End if (pendingrcv > 0)
       }  // End if (conlfd == ON)
+
+      /*
+       * REST ONLY WHEN BOTH SIDES HAVE BEEN QUIET, which this loop did not.
+       *
+       * Once both halves of the peer connection are up, the 50 ms poll in the
+       * conrfd == OFF branch above is skipped and NOTHING in the loop blocks:
+       * the peer side asks ioctl(FIONREAD) -- or poll with a ZERO timeout --
+       * and the line side the same, and both return immediately. MEASURED
+       * 2026-10-27, native build on Debian 13, with a Cisco 2522 at CONNECT
+       * and no circuit: 100.0% of a core, sampled with top, for the life of
+       * the run.
+       *
+       * This is Trunk_cl.c's defect in another file, and the fix is the one
+       * measured there: rest only after sustained inactivity and reset on any
+       * byte, so a busy bridge never sleeps and an idle one costs nothing.
+       * 2000 passes and 200 us are that file's values, which recovered 13.7x
+       * of its 14x. AN UNCONDITIONAL SLEEP HERE WOULD BE WRONG: in the trunk
+       * it added latency to every character and broke a remote network
+       * control program load outright.
+       */
+      if (busy) {
+         idle = 0;
+      } else if (++idle >= 2000) {
+         idle = 2000;
+#if defined(__GENODE__)
+         /* The component's Timer session: that platform's libc floors usleep
+            at 1 ms, which is five times this rest. */
+         genode_pace_us(200);
+#else
+         usleep(200);
+#endif
+      }
    }  // End while (1)
    return;
 }
