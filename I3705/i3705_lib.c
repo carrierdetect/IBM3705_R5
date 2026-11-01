@@ -389,6 +389,22 @@ int ReadLIB(int k) {
           * waiting, which has nothing to do with the relay and channel
           * spins that 0013 and 0014 removed. The knob exists to make that
           * re-measurable, not because a non-zero value is known to be safe.
+          *
+          * AND A NON-ZERO VALUE CANNOT BUY WHAT THIS COMMENT HOPED
+          * (2026-11-01, read in Genode's libc rather than guessed).
+          * poll() runs its plugin pass inside the libc monitor BEFORE it
+          * consults the timeout at all (libports/src/lib/libc/poll.cc),
+          * and from a non-main context -- this scanner is a pthread --
+          * the monitor enqueues a job and waits for the component's
+          * ENTRYPOINT to run it (internal/kernel.h, _monitor). So even a
+          * zero-timeout poll here IS an entrypoint round trip, and raising
+          * the timeout cannot shorten that round trip; it only adds a
+          * sleep per idle line per cycle on top of it. Measured the same
+          * evening: the round trip costs 45 us when the controller's
+          * channel crosslinks have a core of their own and 16,500 us when
+          * they share one with a partition that never yields --
+          * results/placement-channel-under-a-spinner-prediction.txt. The
+          * knob stays for measurement; it is not a lever on that cost.
           */
          pendingrcv = genode_ca_avail(LIBline[k]->d327x_fd, LinePollMs);
          rc = 0;
