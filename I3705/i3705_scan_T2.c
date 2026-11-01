@@ -1393,6 +1393,22 @@ void *CS2_thread(void *arg) {
                   for (int z = 0; z < 6; z++) lvl_hist[z] = 0;
                }
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
+#if defined(__GENODE__)
+                  {  /* POLLUS: is the body's time inside poll() itself? */
+                     extern void xlink_poll_stats(unsigned long *,
+                                                  unsigned long long *,
+                                                  unsigned long long *);
+                     unsigned long      pc = 0;
+                     unsigned long long pt = 0, pm = 0;
+                     xlink_poll_stats(&pc, &pt, &pm);
+                     SP_REPORT(SP_CR "POLLUS: calls=%lu us/call=%.2f max=%.0f us"
+                                     " per-cycle=%.1f us\n",
+                               pc,
+                               pc ? pt/(double)pc/sp_tsc_mhz() : 0.0,
+                               pm/sp_tsc_mhz(),
+                               sp_split_cyc ? pt/(double)sp_split_cyc/sp_tsc_mhz() : 0.0);
+                  }
+#endif
                   {  /* BODYSPLIT, per line, in us per cycle */
                      int ln;
                      SP_REPORT(SP_CR "BODYSPLIT: cycles=%llu",
