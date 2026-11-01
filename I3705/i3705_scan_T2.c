@@ -219,6 +219,28 @@ extern volatile unsigned long x55_img[3];
    so these are milliseconds per second spent waiting for the CCU. */
 volatile unsigned long l2wait[3];
 static uint64_t sp_sleep, sp_body, sp_cycles, sp_last;
+/*
+ * BODYSPLIT: WHERE THE BODY'S TIME GOES, PER LINE (2026-11-01).
+ *
+ * SCANPERF splits a cycle into the pacing wait and "the body", and that split
+ * has twice been enough to name a starvation: an inflated WAIT is contention
+ * for this thread's own core, a textbook wait with an inflated BODY is a wait
+ * on something off it. On 2026-11-01 it stopped being enough. With the 3705 on
+ * a core of its own, its cluster controllers pinned and ONLY the channel
+ * crosslinks left on a core carrying a spinning partition, the wait stayed at
+ * 526 us and the body went from 51 us to 15,965 -- and every existing
+ * instrument inside the body read unchanged: l2w 0/0/0 (neither level-2 wait
+ * loop ran), LVLUS w=345->268 us with every level zero, PCF states constant at
+ * 5 and 0 so DWELL recorded no transitions at all. The scanner does not even
+ * reference the channel crosslink (no genode_ca_*, no socket handles in this
+ * file), so "the body waits on it" cannot be said as it stands.
+ *
+ * So this splits the body itself, per line, into the PCF state machine and
+ * everything after it. Two rdtsc per line per cycle on top of the two
+ * SCANPERF already pays; rdtscp was measured at 39 ticks on this hardware, so
+ * four more is ~0.05 us against a 590 us cycle.
+ */
+static uint64_t sp_sw[MAX_LINES], sp_post[MAX_LINES], sp_split_cyc;
 static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
 
 /* SCANSPIN=1: pace with a bounded rdtsc spin instead of a timer sleep.
@@ -703,6 +725,7 @@ void *CS2_thread(void *arg) {
             }
          }
 
+         uint64_t const bs_t0 = sp_tsc();         /* BODYSPLIT: the state machine */
          switch (icw_pcf[line]) {
             case 0x0:                                // NO-OP
                if (icw_pcf_prev[line] != icw_pcf[line]) {
@@ -1208,6 +1231,8 @@ void *CS2_thread(void *arg) {
                break;
 
          }  // End of switch (icw_pcf[line])
+         uint64_t const bs_t1 = sp_tsc();
+         sp_sw[line] += bs_t1 - bs_t0;
          //pthread_mutex_unlock(&icw_lock);
 
 
@@ -1257,6 +1282,7 @@ void *CS2_thread(void *arg) {
                   sp_l2_wait(1000);
                }
          }   // End   while (svc_req_L2 == ON)
+         sp_post[line] += sp_tsc() - bs_t1;       /* BODYSPLIT: the rest */
       }  // End for line = 0 ---> MAX_LINES          // End of scanning one line, next please...
       {
          uint64_t const t0 = sp_tsc();
@@ -1291,6 +1317,7 @@ void *CS2_thread(void *arg) {
             if (sp_last) sp_body += t0 - sp_last;
             sp_last = t1;
             tw_count[0]++;
+            sp_split_cyc++;                          /* BODYSPLIT's denominator */
             if (++sp_cycles >= 500) {
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08)) {
                   static uint64_t tw_last = 0;
@@ -1366,6 +1393,18 @@ void *CS2_thread(void *arg) {
                   for (int z = 0; z < 6; z++) lvl_hist[z] = 0;
                }
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08))   /* SIM_TRACE=08 */
+                  {  /* BODYSPLIT, per line, in us per cycle */
+                     int ln;
+                     SP_REPORT(SP_CR "BODYSPLIT: cycles=%llu",
+                               (unsigned long long)sp_split_cyc);
+                     for (ln = 0; ln < ((Sdbg_reg & 0x10) ? MAX_LINES : 2); ln++)
+                        SP_REPORT(" L%d sw=%.1f post=%.1f", ln,
+                                  sp_sw[ln]  /(double)(sp_split_cyc?sp_split_cyc:1)/sp_tsc_mhz(),
+                                  sp_post[ln]/(double)(sp_split_cyc?sp_split_cyc:1)/sp_tsc_mhz());
+                     SP_REPORT(" us/cycle\n");
+                     for (ln = 0; ln < MAX_LINES; ln++) { sp_sw[ln] = 0; sp_post[ln] = 0; }
+                     sp_split_cyc = 0;
+                  }
                   SP_REPORT(SP_CR "SCANPERF: cycles=%llu sleep=%llu body=%llu tsc pct_sleep=%llu\n",
                          (unsigned long long)sp_cycles,
                          (unsigned long long)(sp_sleep / sp_cycles),
