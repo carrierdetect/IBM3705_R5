@@ -97,7 +97,7 @@ extern void wait();
    signature: it has one void* parameter and returns void    */
 
 void *PNL_thread(void *arg) {
-   fprintf(stderr, "PNL: Thread %ld started succesfully... \n\r", THREAD_ID());
+   fprintf(stderr, "PNL: Thread %ld started succesfully... " CRNL, THREAD_ID());
 
    // We can set one or more bits here, each one representing a single CPU
    //cpu_set_t cpuset;
@@ -199,7 +199,7 @@ void *PNL_thread(void *arg) {
             break;
          case LOAD:                                          /* Load key pressed     */
             load_prsd = TRUE;                                /* Indicate a load is required */
-      printf("PNL: LOAD pressed, rebooting....\n\r");
+      printf("PNL: LOAD pressed, rebooting...." CRNL);
             cp3705->pnlkey = NOKEY;                          /* Reset key pressed           */
             break;
          case INTERRUPT:                                     /* Interrupt key pressed     */

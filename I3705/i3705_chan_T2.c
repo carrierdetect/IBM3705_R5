@@ -247,13 +247,13 @@ struct epoll_event event, events[MAXCHAN*2];
 // ************************************************************
 void print_hex(char *buffptr, int buf_len) {
    if ((Adbg_flag == ON) && (Adbg_reg & 0x01)) {   // Trace channel adapter activities ?
-      fprintf(A_trace, "\nRecord length: %X  (hex)\n\r", buf_len);
+      fprintf(A_trace, "\nRecord length: %X  (hex)" CRNL, buf_len);
          for (int i = 0; i < buf_len; i++) {
             fprintf(A_trace, "%02X ", (unsigned char)buffptr[i]);
             if ((i + 1) % 16 == 0)
-               fprintf(A_trace, "\n\r");
+               fprintf(A_trace, CRNL);
          }  // End for  int i
-      fprintf(A_trace, "\n\r");
+      fprintf(A_trace, CRNL);
       }  // End if Adbg
    return;
 }
@@ -263,20 +263,20 @@ void print_hex(char *buffptr, int buf_len) {
 // ************************************************************
 void print_regs(struct IO3705 *iob, char *text) {
    if ((Adbg_flag == ON) && (Adbg_reg & 0x01)) {   // Trace channel adapter activities ?
-      fprintf(A_trace, "\n************************** Channel Adapter %c Register display **********************\n\r", iob->CA_id);
-      fprintf(A_trace, "CA code location: %s\n\r", text);
-      fprintf(A_trace, "     x'50' x'51' x'52' x'53' x'54' x'55' x'56' x'57' x'58' x'59' x'5A' x'5B' x'5C' \n\r");
+      fprintf(A_trace, "\n************************** Channel Adapter %c Register display **********************" CRNL, iob->CA_id);
+      fprintf(A_trace, "CA code location: %s" CRNL, text);
+      fprintf(A_trace, "     x'50' x'51' x'52' x'53' x'54' x'55' x'56' x'57' x'58' x'59' x'5A' x'5B' x'5C' " CRNL);
       fprintf(A_trace, "In : ");
       for (uint8_t h = 0x50; h <= 0x5C; h++) {
          fprintf(A_trace, "%04X  ", Eregs_Inp[h] );
       }
-      fprintf(A_trace, "\n\r");
+      fprintf(A_trace, CRNL);
       fprintf(A_trace, "Out: ");
       for (uint8_t h = 0x50; h <= 0x5B; h++) {
          fprintf(A_trace, "%04X  ", Eregs_Out[h] );
       }
-      fprintf(A_trace, "\n\r");
-      fprintf(A_trace, "************************************************************************************\n\r");
+      fprintf(A_trace, CRNL);
+      fprintf(A_trace, "************************************************************************************" CRNL);
       fflush(A_trace);
    }
 }
@@ -329,7 +329,7 @@ int host_connect(struct IO3705 *iob, int abport) {
    if (iob->bus_socket[abport] < 0 || iob->tag_socket[abport] < 0)
       return -1;
 
-   printf("CA%c: bus and tag attached on channel %c\n\r",
+   printf("CA%c: bus and tag attached on channel %c" CRNL,
           iob->CA_id, abswid[abport]);
    return 0;
 #else
@@ -368,7 +368,7 @@ int host_connect(struct IO3705 *iob, int abport) {
          return -1;
       }
 
-      printf("CA%c: New bus connection on 3705 port %d, socket fd is %d, ip is : %s, port : %d \n\r",
+      printf("CA%c: New bus connection on 3705 port %d, socket fd is %d, ip is : %s, port : %d " CRNL,
             iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport], iob->bus_socket[abport], inet_ntoa(iob->address[abport].sin_addr),
             (ntohs(iob->address[abport].sin_port)));
    }
@@ -378,13 +378,13 @@ int host_connect(struct IO3705 *iob, int abport) {
       iob->tag_socket[abport] = accept(iob->CA_socket[abport], (struct sockaddr *)&iob->address[abport], (socklen_t*)&iob->addrlen[abport]);
 
       if (iob->tag_socket[abport] > 0) {
-         printf("CA%c: New tag connection on 3705 port %d, socket fd is %d, ip is : %s, port : %d \n\r",
+         printf("CA%c: New tag connection on 3705 port %d, socket fd is %d, ip is : %s, port : %d " CRNL,
                   iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport], iob->tag_socket[abport], inet_ntoa(iob->address[abport].sin_addr),
                   (ntohs(iob->address[abport].sin_port)));
          break;
       } else {
          if (errno != EAGAIN)  {
-            printf("CA%c: Host accept failed with errno %d for tag connection...\n\r", iob->CA_id, errno);
+            printf("CA%c: Host accept failed with errno %d for tag connection..." CRNL, iob->CA_id, errno);
             return -1;
          }
       }
@@ -414,16 +414,16 @@ void send_carnstat(int sockptr, char *carnstat, uint8_t *ackbuf, char CA_id) {
       Eregs_Inp[0x55] &= ~0x4000;  // Reset zero override flag
 
    if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-      fprintf(A_trace, "CA%c: CARNSTAT %02X via socket %d\n\r", CA_id, *carnstat, sockptr);
+      fprintf(A_trace, "CA%c: CARNSTAT %02X via socket %d" CRNL, CA_id, *carnstat, sockptr);
    if (sockptr != -1) {
       rc = send(sockptr, carnstat, 1, 0);
    if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-         fprintf(A_trace, "CA%c: Send %d bytes on socket %d\n\r", CA_id, rc, sockptr);
+         fprintf(A_trace, "CA%c: Send %d bytes on socket %d" CRNL, CA_id, rc, sockptr);
    } else
       rc = -1;
 
    if (rc < 0) {
-      printf("CA%c: CA status send to host failed...\n\r", CA_id);
+      printf("CA%c: CA status send to host failed..." CRNL, CA_id);
       return;
    }
    Eregs_Out[0x54] &= ~0xFFFF;                      // Reset CA status bytes
@@ -462,7 +462,7 @@ int read_socket(int sockptr, char *buffptr, int buffsize) {
    bzero(buffptr, buffsize);
    reclen = read(sockptr, buffptr, buffsize);
    if (reclen < 1)
-      printf("CA: Read failed with error %s \n\r", strerror(errno));
+      printf("CA: Read failed with error %s " CRNL, strerror(errno));
    return reclen;
 }
 
@@ -492,7 +492,7 @@ int read_socket_n(int sockptr, char *buffptr, int want) {
    while (got < want) {
       int rc = read(sockptr, buffptr + got, want - got);
       if (rc <= 0) {
-         printf("CA: short read, wanted %d got %d\n\r", want, got);
+         printf("CA: short read, wanted %d got %d" CRNL, want, got);
          return rc;
       }
       got += rc;
@@ -532,7 +532,7 @@ int close_socket(struct IO3705 *iob, int abchannel) {
       close(iob->CA_socket[abchannel]);
       iob->CA_socket[abchannel] = -1;
 
-      printf("CA%c: Channel connection %c closed\n\r", iob->CA_id, abswid[abchannel]);
+      printf("CA%c: Channel connection %c closed" CRNL, iob->CA_id, abswid[abchannel]);
    }
    return 0;
 #endif
@@ -546,7 +546,7 @@ int send_socket(int sockptr, char *respp, int respsize) {
    rc = send (sockptr, respp, respsize, 0);
 
    if (rc < 0) {
-      printf("CA: Send to host failed...\n\r");
+      printf("CA: Send to host failed..." CRNL);
       return -1;
    }
    return 0;
@@ -567,11 +567,11 @@ void start_listen(struct IO3705 *iob, int abport) {
    genode_ca_fds((unsigned)(iob->CA_id - '0'), abport, &bus, &tag);
 
    if (bus < 0 || tag < 0) {
-      printf("CA%c: channel %c is not configured\n\r",
+      printf("CA%c: channel %c is not configured" CRNL,
              iob->CA_id, abswid[abport]);
       return;
    }
-   printf("CA%c: waiting for the channel on %c (bus fd %d, tag fd %d)\n\r",
+   printf("CA%c: waiting for the channel on %c (bus fd %d, tag fd %d)" CRNL,
           iob->CA_id, abswid[abport], bus, tag);
 #else
 
@@ -587,28 +587,28 @@ void start_listen(struct IO3705 *iob, int abport) {
    iob->address[abport].sin_port = htons( CAPORTS[(iob->CA_id - '0')-1][abport] );
 
    if (-1 == setsockopt(iob->CA_socket[abport], SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag))) {
-      printf("CA%c: Setsockopt failed for Channel %c with error %s\n\r", iob->CA_id, abswid[abport], strerror(errno));
+      printf("CA%c: Setsockopt failed for Channel %c with error %s" CRNL, iob->CA_id, abswid[abport], strerror(errno));
    }
    // Bind the socket to localhost port PORT
    if (bind(iob->CA_socket[abport], (struct sockaddr *)&iob->address[abport], sizeof(iob->address[abport])) < 0) {
-      printf("CA%c: bind failed for port %d\n\r", iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport] );
+      printf("CA%c: bind failed for port %d" CRNL, iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport] );
       exit(EXIT_FAILURE);
    }
    // Listen and verify
    if ((listen(iob->CA_socket[abport], 5)) != 0) {
-      printf("CA%c: Listen failed for port %c\n\r", iob->CA_id, abswid[abport]);
+      printf("CA%c: Listen failed for port %c" CRNL, iob->CA_id, abswid[abport]);
       exit(-1);
    }
    // Add polling events for the port
    event.events = EPOLLIN | EPOLLONESHOT;
    event.data.fd = iob->CA_socket[abport];
    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, iob->CA_socket[abport], &event)) {
-      printf("CA%c: Add polling event failed for port %c with error %s \n\r", iob->CA_id, abswid[abport], strerror(errno));
+      printf("CA%c: Add polling event failed for port %c with error %s " CRNL, iob->CA_id, abswid[abport], strerror(errno));
       close(epoll_fd);
       exit(-2);
    }
    // Now server is ready to listen
-   printf("CA%c: Waiting for channel connection on TCP port %d \n\r", iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport] );
+   printf("CA%c: Waiting for channel connection on TCP port %d " CRNL, iob->CA_id, CAPORTS[(iob->CA_id - '0')-1][abport] );
 #endif
 }
 
@@ -627,7 +627,7 @@ void exec_attn() {
    else
       j = 1;
    if ((Adbg_flag == ON) && (Adbg_reg & 0x01))       // Trace channel adapter activities ?
-      fprintf(A_trace, "CA%c: L3 register 55 %04X \n\r", iobs[j]->CA_id, Eregs_Out[0x55]);
+      fprintf(A_trace, "CA%c: L3 register 55 %04X " CRNL, iobs[j]->CA_id, Eregs_Out[0x55]);
    Eregs_Inp[0x55] |= 0x0200;                        // Set Attention Request
    pthread_mutex_lock(&r77_lock);
    Eregs_Inp[0x77] |= iobs[j]->CA_mask;              // Set CA1 L3 Interrupt Request
@@ -643,11 +643,11 @@ void exec_attn() {
    //carnstat = ((Eregs_Out[0x54] >> 8 ) & 0x00FF);  // Get CA return status
    if (iobs[j]->CA_active == TRUE) {
       if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-          fprintf(A_trace, "CA%c: Sending ATTN\n\r", iobs[j]->CA_id);
+          fprintf(A_trace, "CA%c: Sending ATTN" CRNL, iobs[j]->CA_id);
       // Send CA retun status to host
       send_carnstat(iobs[j]->tag_socket[iobs[j]->abswitch], &carnstat, &ackbuf, iobs[j]->CA_id);
    } else {
-      printf("CA%c: Channel not active, ATTN not send \n\r");
+      printf("CA%c: Channel not active, ATTN not send " CRNL);
    }
    return;
 }
@@ -663,7 +663,7 @@ void exec_pci() {
       else
          j = 1;
       if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-         fprintf(A_trace, "CA%c: L3 register 57 %04X \n\r", iobs[j]->CA_id, Eregs_Out[0x57]);
+         fprintf(A_trace, "CA%c: L3 register 57 %04X " CRNL, iobs[j]->CA_id, Eregs_Out[0x57]);
       while (Ireg_bit(0x77, iobs[j]->CA_mask) == ON)
          wait();
       Eregs_Inp[0x55] |= 0x0800;                     // Set Program Requested L3 interrupt
@@ -675,7 +675,7 @@ void exec_pci() {
       CA1_IS_req_L3 = ON;
       pthread_mutex_unlock(&r77_lock);
       if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-         fprintf(A_trace, "CA%c: Requested L3 interrupt\n\r", iobs[j]->CA_id);
+         fprintf(A_trace, "CA%c: Requested L3 interrupt" CRNL, iobs[j]->CA_id);
       while (Ireg_bit(0x77, iobs[j]->CA_mask) == ON) wait();
          wait();
       Eregs_Out[0x57] &= ~0x0080;                    // Reset L3 request
@@ -686,18 +686,18 @@ void exec_pci() {
 // Function for handling diagnostic wrap mode
 // ************************************************************
 void exec_diag() {
-         printf("CA: 3705 Diagnostic request \n\r");
+         printf("CA: 3705 Diagnostic request " CRNL);
       // Determine if diagnstic mode needs to be set
       if ((Eregs_Out[0x57] & 0x0001) && !(Eregs_Inp[0x55] & 0x8000))  {
          Eregs_Inp[0x55] |= 0x8000;           // Diagnostic wrap mode on
          //iob->CA_active = FALSE;              // set CA to inactive
-         printf("CA: 3705 Diagnostic mode turned on\n\r");
+         printf("CA: 3705 Diagnostic mode turned on" CRNL);
       }
       // Determine if diagnstic mode needs to be turned off
       if ((Eregs_Out[0x57] & 0x0000) && (Eregs_Inp[0x55] & 0x8000))  {
          Eregs_Inp[0x55] &= ~0x8000;           // Diagnostic wrap mode off
          //iob->CA_active = TRUE  ;              // set CA to active
-         printf("CA: 3705 Diagnostic mode turned off\n\r");
+         printf("CA: 3705 Diagnostic mode turned off" CRNL);
       }
    return;
 }
@@ -716,7 +716,7 @@ void *CA_T2_thread(void *arg) {
       uint64_t u64;
    } epoll_Data_t;
 
-   printf("CA-T2: Main thread %ld started succesfully...\n\r", THREAD_ID());
+   printf("CA-T2: Main thread %ld started succesfully..." CRNL, THREAD_ID());
    /* The knobs are NOT reported here. scp.c's main() creates this thread as
       its very first act, before it parses any argument or runs the .cnf, so
       anything read here is the compile-time default and not what the
@@ -942,7 +942,7 @@ void *CA_T2_thread(void *arg) {
              * threads and it is what receives the remote load.
              */
             if (iobs[j]->abswitch == -1) {
-               printf("CA%c: disabled, no host expected\n\r", iobs[j]->CA_id);
+               printf("CA%c: disabled, no host expected" CRNL, iobs[j]->CA_id);
                waiting[j] = 0;
                pending--;
                continue;
@@ -958,11 +958,11 @@ void *CA_T2_thread(void *arg) {
             pending--;
 
             if (rc < 2) {
-               printf("CA%c: no device address from the host\n\r", iobs[j]->CA_id);
+               printf("CA%c: no device address from the host" CRNL, iobs[j]->CA_id);
                continue;
             }
             iobs[j]->devnum = (iobs[j]->buffer[0] << 8) | iobs[j]->buffer[1];
-            printf("CA%c: Connected to device %04X\n\r",
+            printf("CA%c: Connected to device %04X" CRNL,
                    iobs[j]->CA_id, iobs[j]->devnum);
             iobs[j]->CA_active = TRUE;
          }
@@ -970,7 +970,7 @@ void *CA_T2_thread(void *arg) {
          if (pending > 0 && waited > 0 && waited % 50 == 0)
             for (int j = 0; j < MAXCHAN; j++)
                if (waiting[j])
-                  printf("CA%c: waiting for the host to claim the channel\n\r",
+                  printf("CA%c: waiting for the host to claim the channel" CRNL,
                          iobs[j]->CA_id);
       }
    }
@@ -1001,7 +1001,7 @@ void *CA_T2_thread(void *arg) {
                event.events = EPOLLIN | EPOLLONESHOT;
                event.data.fd = iobs[i]->CA_socket[iobs[i]->abswitch];
                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, iobs[i]->CA_socket[iobs[i]->abswitch], &event)) {
-                  printf("Modifying polling event error %d for CA%c-%c\n\r", errno, iobs[i]->CA_id, abswid[iobs[i]->abswitch]);
+                  printf("Modifying polling event error %d for CA%c-%c" CRNL, errno, iobs[i]->CA_id, abswid[iobs[i]->abswitch]);
                   close(epoll_fd);
                   return 0;
                } // End if (epoll_ctl(epoll_fd
@@ -1030,7 +1030,7 @@ void *CA_T2_thread(void *arg) {
                         rc = read_socket_n(iobs[j]->bus_socket[iobs[j]->abswitch], (char *)iobs[j]->buffer, 2);
                         if (rc == 2) {
                            iobs[j]->devnum = (iobs[j]->buffer[0] << 8) | iobs[j]->buffer[1];
-                           printf("CA%c: Connected to device %04X\n\r", iobs[j]->CA_id, iobs[j]->devnum);
+                           printf("CA%c: Connected to device %04X" CRNL, iobs[j]->CA_id, iobs[j]->devnum);
                            // Change the CA status to active
                            iobs[j]->CA_active = TRUE;
                         } else {
@@ -1051,7 +1051,7 @@ void *CA_T2_thread(void *arg) {
 
 #if !defined(__GENODE__)
    if (close(epoll_fd)) {
-      printf("CA_T2: failed to close epoll file descriptor\n\r");
+      printf("CA_T2: failed to close epoll file descriptor" CRNL);
       return 0;
    }
 #endif
@@ -1067,7 +1067,7 @@ void *CAx_thread(void *arg) {
 
    int  pendingrcv;
 
-   printf("CA: Adapter thread %d started sucessfully... \n\r", getpid());
+   printf("CA: Adapter thread %d started sucessfully... " CRNL, getpid());
 
    pthread_mutex_lock(&r77_lock);
    CA1_DS_req_L3 = OFF;                    // Chan Adap Data/Status request flag
@@ -1171,7 +1171,7 @@ void exec_ccw(struct IO3705 *iob) {
    /*                                                             */
    /***************************************************************/
    if (iob->bus_socket[iob->abswitch] < 1) {
-      printf("CA%c: Aborting due to loss of active channel connection...\n\r", iob->CA_id);
+      printf("CA%c: Aborting due to loss of active channel connection..." CRNL, iob->CA_id);
       return;
    }
 
@@ -1209,7 +1209,7 @@ void exec_ccw(struct IO3705 *iob) {
 
    if (rc <= 0) {
       // Host disconnected, get details and print it
-      printf("CA%c: Error reading CCW, closing channel connection\n\r", iob->CA_id);
+      printf("CA%c: Error reading CCW, closing channel connection" CRNL, iob->CA_id);
       // Change the CA status to inactive
       iob->CA_active = FALSE;
 
@@ -1231,7 +1231,7 @@ void exec_ccw(struct IO3705 *iob) {
       Eregs_Inp[0x5C] &= ~0xFFFF;                        // Clear command flags CA Command Register
       Eregs_Inp[0x55] &= ~0x0800;                        // Program Requested L3 interrupt flag should be off
       if ((Adbg_flag == ON) && (Adbg_reg & 0x01))        // Trace channel adapter activities ?
-         fprintf(A_trace, "CA%c: Channel Command: %02X, length: %d, Flags: %02X, Chained: %02X \n\r",
+         fprintf(A_trace, "CA%c: Channel Command: %02X, length: %d, Flags: %02X, Chained: %02X " CRNL,
              iob->CA_id, ccw.code, ccw.count, ccw.flags, ccw.chain);
 
       // **************************************************************
@@ -1299,15 +1299,15 @@ void exec_ccw(struct IO3705 *iob) {
                cacw2 = 0;
                cacw2 = ((M[outcwar+1] & 0x0003) << 16) + (M[outcwar+2] << 8) + (M[outcwar+3] & 0x00FF);
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                  fprintf(A_trace, "OUTCWAR %04X, CW %02X%02X %02X%02X\n\r",
+                  fprintf(A_trace, "OUTCWAR %04X, CW %02X%02X %02X%02X" CRNL,
                        outcwar, M[outcwar], M[outcwar+1], M[outcwar+2], M[outcwar+3]);
                Eregs_Out[0x51] = Eregs_Out[0x51] + 4;
 
                Eregs_Inp[0x5C] |= 0x0080;                // Set command register to OUT Control Word
                Eregs_Inp[0x59]  = cacw2;                 // Load cycle steal address with data load start address
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01)) {   // Trace channel adapter activities ?
-                  fprintf(A_trace, "CW %04X\n\r", cacw1);
-                  fprintf(A_trace, "Fetch starts at %06X, count = %04X\n\r", cacw2, wdcnt);
+                  fprintf(A_trace, "CW %04X" CRNL, cacw1);
+                  fprintf(A_trace, "Fetch starts at %06X, count = %04X" CRNL, cacw2, wdcnt);
                }
                wdcnttmp = wdcnt;                         // Bytes to be transferred for this CW
                wdcnttot = wdcnttot + wdcnt;              // Total byte count
@@ -1344,7 +1344,7 @@ void exec_ccw(struct IO3705 *iob) {
                      condition = 3;
                }
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                  fprintf(A_trace, "Condition = %d\n\r", condition);
+                  fprintf(A_trace, "Condition = %d" CRNL, condition);
 
             }  while (condition == 0);     // End of do stmt.
 
@@ -1437,7 +1437,7 @@ void exec_ccw(struct IO3705 *iob) {
                Eregs_Out[0x53] &= ~0x8000;
             }
             if ((Adbg_flag == ON) && (Adbg_reg & 0x01))  // Trace channel adapter activities ?
-               fprintf(A_trace, "CA%c: Sending sense Byte 0 %02X \n\r", iob->CA_id, iob->buffer[0]);
+               fprintf(A_trace, "CA%c: Sending sense Byte 0 %02X " CRNL, iob->CA_id, iob->buffer[0]);
 
             rc = send_socket(iob->bus_socket[iob->abswitch], (void*)&iob->buffer, 1);
 
@@ -1499,12 +1499,12 @@ void exec_ccw(struct IO3705 *iob) {
                                   (char *)(iob->chainbuf + iob->chainbl), want);
             }
             if ((Adbg_flag == ON) && (Adbg_reg & 0x01))  // Trace channel adapter activities ?
-               fprintf(A_trace, "CA%c: received: %d bytes from host\n\r", iob->CA_id, rc);
+               fprintf(A_trace, "CA%c: received: %d bytes from host" CRNL, iob->CA_id, rc);
             iob->bufferl = rc;
             iob->chainbl = iob->chainbl + rc;
             if (ccw.flags & 0x80) {
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                  fprintf(A_trace, "CA%c: data chaining \n\r", iob->CA_id);
+                  fprintf(A_trace, "CA%c: data chaining " CRNL, iob->CA_id);
                carnstat = CSW_CEND | CSW_DEND;   // Set CA return status
                // Send CA return status to host
                send_carnstat(iob->bus_socket[iob->abswitch], &carnstat, &ackbuf, iob->CA_id);
@@ -1524,7 +1524,7 @@ void exec_ccw(struct IO3705 *iob) {
                do {   // While condition remains 0
                   condition = 1;
                   if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                     fprintf(A_trace, "InpReg 55 %04X, OutReg 55 %04X\n\r", Eregs_Inp[0x55], Eregs_Out[0x55]);
+                     fprintf(A_trace, "InpReg 55 %04X, OutReg 55 %04X" CRNL, Eregs_Inp[0x55], Eregs_Out[0x55]);
                   while (reg_bit(0x55, 0x2000) == OFF)   // Wait for INCWAR to become valid
                      wait();
 
@@ -1552,18 +1552,18 @@ void exec_ccw(struct IO3705 *iob) {
                   cacw2 = 0;
                   cacw2 = ((M[incwar+1] & 0x0003) << 16) + (M[incwar+2] << 8) + (M[incwar+3] & 0x00FF);
                   if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                     fprintf(A_trace, "INCWAR %04X, CW %02X%02X %02X%02X\n\r", incwar, M[incwar], M[incwar+1], M[incwar+2], M[incwar+3]);
+                     fprintf(A_trace, "INCWAR %04X, CW %02X%02X %02X%02X" CRNL, incwar, M[incwar], M[incwar+1], M[incwar+2], M[incwar+3]);
                   Eregs_Out[0x50] = Eregs_Out[0x50] + 4;
 
                   Eregs_Inp[0x5C] |= 0x0020;             // Set command register to IN Control Word
                   Eregs_Inp[0x59] = cacw2;               // Load cycle steal address with data load start address
                   if ((Adbg_flag == ON) && (Adbg_reg & 0x01)) {   // Trace channel adapter activities ?
-                     fprintf(A_trace, "CW %04X\n\r", cacw1);
-                     fprintf(A_trace, "Load starts at %06X, count=%04X\n\r", cacw2, wdcnt);
+                     fprintf(A_trace, "CW %04X" CRNL, cacw1);
+                     fprintf(A_trace, "Load starts at %06X, count=%04X" CRNL, cacw2, wdcnt);
                   }
                   wdcnttmp = wdcnt < iob->bufferl?wdcnt:iob->bufferl;
                   if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                     fprintf(A_trace, "(1) wdcnttmp=%d, wdcnt=%d, iob->bufferl=%d\n\r", wdcnttmp, wdcnt, iob->bufferl);
+                     fprintf(A_trace, "(1) wdcnttmp=%d, wdcnt=%d, iob->bufferl=%d" CRNL, wdcnttmp, wdcnt, iob->bufferl);
 
                   for (i = 0; i < wdcnttmp; i++) {
                      M[cacw2 + i] = iob->chainbuf[bufbase + i];  // Load data directly into memory
@@ -1594,7 +1594,7 @@ void exec_ccw(struct IO3705 *iob) {
 
 
             if ((Adbg_flag == ON) && (Adbg_reg & 0x01))  // Trace channel adapter activities ?
-               fprintf(A_trace, "CA%c: Data transfer complete, loaded %04X, remainder %04X\n\r",
+               fprintf(A_trace, "CA%c: Data transfer complete, loaded %04X, remainder %04X" CRNL,
                  iob->CA_id, wdcnttmp, wdcnt);
             // If byte count is zero, and there is no chaining
             // we will send a L3 interrupt to to CCU, otherwise...
@@ -1614,13 +1614,13 @@ void exec_ccw(struct IO3705 *iob) {
             if (wdcnt != 0)  {
                Eregs_Inp[0x55] |= 0x0020;                // Set channel stop
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01))   // Trace channel adapter activities ?
-                  fprintf(A_trace, "CA%c: Channel Stop\n\r", iob->CA_id);
+                  fprintf(A_trace, "CA%c: Channel Stop" CRNL, iob->CA_id);
             }
             Eregs_Inp[0x55] &= ~0x4000;                  // Reset zero override flag
           //<- }
             if (Eregs_Inp[0x55] & 0x4000)  {             // if Zero Count Override
                if ((Adbg_flag == ON) && (Adbg_reg & 0x01))    // Trace channel adapter activities ?
-                  fprintf(A_trace, "CA%c: Zero Override on\n\r", iob->CA_id);
+                  fprintf(A_trace, "CA%c: Zero Override on" CRNL, iob->CA_id);
             } // End if Eregs_Inp[0x55]
             //Eregs_Inp[0x55] |= 0x3000;
 
@@ -1674,11 +1674,11 @@ void exec_ccw(struct IO3705 *iob) {
             // so a reject during one means the adapter is reading data as a
             // command, which is the failure mode three separate bugs in this
             // file have already produced. Silence here cost an afternoon.
-            printf("CA%c: command reject, CCW %02X count %d flags %02X\n\r",
+            printf("CA%c: command reject, CCW %02X count %d flags %02X" CRNL,
                    iob->CA_id, ccw.code, ccw.count, ccw.flags);
             //iob->buffer[0] = SENSE_CR;                  // Load sense data byte 0
             //if (debug_reg & 0x80)
-            //   printf("CA%c: Sending sense Byte 0 %02X \n\r", iob->CA_id, iob->buffer[0]);
+            //   printf("CA%c: Sending sense Byte 0 %02X " CRNL, iob->CA_id, iob->buffer[0]);
             //Eregs_Out[0x53] = ((SENSE_CR << 8));           // Set sense byte
               Eregs_Out[0x53] = 0x8200;                      // Set sense byte
 
@@ -1775,7 +1775,7 @@ int wait_at(int line) {
          printf("CA: INTERLOCK STALL at i3705_chan_T2.c:%d after %ld waits -- "
                 "Inp77=%04X Inp55=%04X Inp5A=%04X Out55=%04X Out57=%04X "
                 "CA1mask=%04X CA2mask=%04X IS=%d DS=%d "
-                "lvl=%d%d%d%d%d ncp=%d load=%d\n\r",
+                "lvl=%d%d%d%d%d ncp=%d load=%d" CRNL,
                 line, slot[i].waits,
                 Eregs_Inp[0x77] & 0xFFFF, Eregs_Inp[0x55] & 0xFFFF,
                 Eregs_Inp[0x5A] & 0xFFFF, Eregs_Out[0x55] & 0xFFFF,
@@ -1880,7 +1880,7 @@ static int ca_fault_due(void) {
    if (now.tv_sec - first.tv_sec < CaFaultSecs) return 0;
    fired = 1;
    printf("\rCA: CAFAULT: forcing the OUTCWAR-valid interlock to time out, "
-          "%ld s after the first Read (CAFAULT=%d)\n\r",
+          "%ld s after the first Read (CAFAULT=%d)" CRNL,
           (long)(now.tv_sec - first.tv_sec), CaFaultSecs);
    return 1;
 }
@@ -1895,11 +1895,11 @@ static int ca_wait_outcwar(struct IO3705 *iob) {
    if (!announced) {
       announced = 1;
       if (CaStallSecs > 0)
-         printf("\rCA: interlock bound CASTALL=%ds on the Read's OUTCWAR wait\n\r",
+         printf("\rCA: interlock bound CASTALL=%ds on the Read's OUTCWAR wait" CRNL,
                 CaStallSecs);
       else
-         printf("\rCA: interlock bound DISABLED (CASTALL=0); the wait is unbounded\n\r");
-      printf("\rCA: CAFAULT=%ds%s\n\r", CaFaultSecs,
+         printf("\rCA: interlock bound DISABLED (CASTALL=0); the wait is unbounded" CRNL);
+      printf("\rCA: CAFAULT=%ds%s" CRNL, CaFaultSecs,
              CaFaultSecs > 0 ? " -- the bound will be FORCED that long from now"
                              : " (off; the bound fires only on a real stall)");
    }
@@ -1913,7 +1913,7 @@ static int ca_wait_outcwar(struct IO3705 *iob) {
          Eregs_Inp[0x53] |= 0x1000;      /* sense byte 0 bit 3: equipment check */
          Eregs_Out[0x53] |= 0x1000;
          printf("\rCA%c: STALL BOUND: OUTCWAR valid never arrived in %d s -- "
-                "answering unit check. Out55=%04X Inp55=%04X Out57=%04X%s\n\r",
+                "answering unit check. Out55=%04X Inp55=%04X Out57=%04X%s" CRNL,
                 iob->CA_id, CaStallSecs,
                 Eregs_Out[0x55] & 0xFFFF, Eregs_Inp[0x55] & 0xFFFF,
                 Eregs_Out[0x57] & 0xFFFF,

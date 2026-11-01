@@ -885,19 +885,19 @@ while (reason == 0) {                          /* Loop until halted */
                }
                if (debug_reg & 0x02) {
                   if (lvl == 1)                   // Display CCU interrupt levels
-                     printf("%s >>> Entering lvl 1 -- IPL=%d; OPchk=%d; IOchk=%d; AEchk=%d \n\r",
+                     printf("%s >>> Entering lvl 1 -- IPL=%d; OPchk=%d; IOchk=%d; AEchk=%d " CRNL,
                              TimeStamp(), ipl_req_L1, OP_reg_chk, IO_L5_chk, adr_ex_chk);
                   if (lvl == 2)
-                     printf("%s >>> Entering lvl 2 -- Diag=%d; SVCL2=%d \n\r",
+                     printf("%s >>> Entering lvl 2 -- Diag=%d; SVCL2=%d " CRNL,
                              TimeStamp(), diag_req_L2, svc_req_L2);
                   if (lvl == 3)
-                     printf("%s >>> Entering lvl 3 -- Int=%d; Timer=%d; PCIL3=%d; CA1_IS=%d; CA1_D/S=%d \n\r",
+                     printf("%s >>> Entering lvl 3 -- Int=%d; Timer=%d; PCIL3=%d; CA1_IS=%d; CA1_D/S=%d " CRNL,
                              TimeStamp(), inter_req_L3, timer_req_L3, pci_req_L3, CA1_IS_req_L3, CA1_DS_req_L3);
                   if (lvl == 4)
-                     printf("%s >>> Entering lvl 4 -- PCIL4=%d; SVCL4=%d \n\r",
+                     printf("%s >>> Entering lvl 4 -- PCIL4=%d; SVCL4=%d " CRNL,
                              TimeStamp(), pci_req_L4, svc_req_L4);
                   if (lvl == 5)
-                     printf("%s >>> Entering lvl 5 -- MSKL5=0 \n\r",TimeStamp());
+                     printf("%s >>> Entering lvl 5 -- MSKL5=0 " CRNL,TimeStamp());
                }
                wait_state = OFF;               // Exiting wait state. Lets do some work...
 
@@ -2749,8 +2749,8 @@ while (reason == 0) {                          /* Loop until halted */
             //          CCU updates
             //********************************************************
             if ((Efld == 0x70) && (bypass_CCU_check == OFF)) {      // HARD STOP
-               printf("\nDisplay Reg 1: %05X\n\r", Eregs_Out[0x71]);
-               printf(  "Display Reg 2: %05X\n\r", Eregs_Out[0x72]);
+               printf("\nDisplay Reg 1: %05X" CRNL, Eregs_Out[0x71]);
+               printf(  "Display Reg 2: %05X" CRNL, Eregs_Out[0x72]);
                pgm_stop = ON;
                reason = SCPE_STOP;
                continue;
@@ -2935,7 +2935,7 @@ int32 GetMem(int32 addr)
 {
    if (addr > MEMSIZE) {
       adr_ex_chk = ON;      // Addressing Exception ?
-      printf("AE at addr %d, MEMSIZE %d \n\r", addr, MEMSIZE);
+      printf("AE at addr %d, MEMSIZE %d " CRNL, addr, MEMSIZE);
    }
    else
       return(M[addr] & 0xFF);
@@ -2947,7 +2947,7 @@ int32 PutMem(int32 addr, int32 data)
 {
    if (addr > MEMSIZE) {
       adr_ex_chk = ON;       // Addressing Exception ?
-      printf("AE at addr %d, MEMSIZE %d \n\r", addr, MEMSIZE);
+      printf("AE at addr %d, MEMSIZE %d " CRNL, addr, MEMSIZE);
    }
    else
       M[addr] = data & 0xFF;
@@ -3730,14 +3730,14 @@ char LPG2[] = {
       /* At least one AB switch enabled: this is not a remote 3705       */
          if (Eregs_Inp[0x79] & 0x0002) {
             /* If CA Type 1 or 4 Load miniROS at location 0x0000 */
-            printf("CPU: Loading MiniROS at X'00000' \n\r");
+            printf("CPU: Loading MiniROS at X'00000' " CRNL);
             for (addr = 0x0000; addr < 0x0200; addr++) {
                temp = miniROS[addr];
                PutMem(addr, temp);
             }
          } else {
             /* If CA Type 2 or 3 Load maxiROS at location 0x0000 */
-            printf("CPU: Loading MaxiROS at X'00000'\n\r");
+            printf("CPU: Loading MaxiROS at X'00000'" CRNL);
             for (addr = 0x0000; addr < 0x0200; addr++) {
                temp = maxiROS[addr];
                PutMem(addr, temp);
@@ -3745,17 +3745,17 @@ char LPG2[] = {
          }
          break;
       } else if (i == MAXCHAN-1) {
-         printf("CPU: Booting 3705 from diskette... \n\r");
+         printf("CPU: Booting 3705 from diskette... " CRNL);
          /* RPL switch set:
             load LPG1 from 'diskette' track 0 at location 0x0040 and 0x0400
             and load LPG2 at location max memory - 0x02000 */
-         printf("CPU: Loading LPG1 at X'00400'\n\r");
+         printf("CPU: Loading LPG1 at X'00400'" CRNL);
          for (addr = 0x0000; addr < 0x0600; addr++) {
             temp = LPG1[addr];
             PutMem(addr, temp);
          }
          /* Load LPG2 from 'diskette' track 6&7 at location max memory-0x2000 */
-         printf("CPU: Loading LPG2 at X'%05X'\n\r", MEMSIZE-0x2000);
+         printf("CPU: Loading LPG2 at X'%05X'" CRNL, MEMSIZE-0x2000);
          for (addr = 0x00000; addr < 0x02000; addr++) {
             temp = LPG2[addr];
             PutMem(MEMSIZE - 0x02000 + addr, temp);
@@ -3823,7 +3823,7 @@ t_stat cpu_reset (DEVICE *dptr) {              /* RESET pressed */
    Eregs_Inp[0x7A] = 0x8000;                   /* CUCR RPQ install        */
    cycle_eight = 0;                            /* 8 cycle counter to zero */
 
-   printf("CPU: Reset... \n\r");
+   printf("CPU: Reset... " CRNL);
    msize = MEMSIZE / 1024;
    switch (msize) {
       case 32:
@@ -3854,7 +3854,7 @@ t_stat cpu_reset (DEVICE *dptr) {              /* RESET pressed */
          Eregs_Inp[0x70]  = 0x1000;            // 256 kbyte storage size (3705-II)
       break;
    }
-   printf("CPU: MEMORYSIZE %dK bytes \n\r", msize);
+   printf("CPU: MEMORYSIZE %dK bytes " CRNL, msize);
 
    return SCPE_OK;
 }

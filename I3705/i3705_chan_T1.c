@@ -136,13 +136,13 @@ int wrkid, offset;
 // Function to format and display incomming data from host
 // ************************************************************
 void print_hex(char *buffptr, int buf_len) {
-   printf("\nRecord length: %X  (hex)\n\r", buf_len);
+   printf("\nRecord length: %X  (hex)" CRNL, buf_len);
       for (int i = 0; i < buf_len; i++) {
          printf("%02X ", (unsigned char)buffptr[i]);
          if ((i + 1) % 16 == 0)
-            printf("\n\r");
+            printf(CRNL);
       }
-      printf("\n\r");
+      printf(CRNL);
    return;
 }
 
@@ -152,22 +152,22 @@ void print_hex(char *buffptr, int buf_len) {
 int host_connect(struct IO3705 *iobptr, int *sockptr) {
    // Listen and verify
    if ((listen(iobptr->socket_3705, 5)) != 0) {
-      printf("\nCA1: Listen failed...\n\r");
+      printf("\nCA1: Listen failed..." CRNL);
       exit(0);
    }
    else
-      printf("\nCA1: RPi 3705 waiting for host...\n\r");
+      printf("\nCA1: RPi 3705 waiting for host..." CRNL);
 
    // Accept the incoming connection
    iobptr->addrlen = sizeof(iobptr->address);
 
    *sockptr = accept(iobptr->socket_3705, (struct sockaddr *)&iobptr->address, (socklen_t*)&iobptr->addrlen);
    if (iobptr->ccw_socket < 0) {
-      printf("\nCA1: Host accept failed...\n\r");
+      printf("\nCA1: Host accept failed..." CRNL);
       return -1;
    }
    else
-      printf("\nCA1: New connection, socket fd is %d, ip is : %s, port : %d \n\r",
+      printf("\nCA1: New connection, socket fd is %d, ip is : %s, port : %d " CRNL,
                *sockptr, inet_ntoa(iobptr->address.sin_addr), ntohs
                (iobptr->address.sin_port));
    return 0;
@@ -182,16 +182,16 @@ void send_carnstat(int sockptr, char *carnstat, char *ackbuf) {
    // Send CA retun status to host
    *carnstat = 0x00;
    *carnstat = (Eregs_Out[0x66] & 0x00FF);
-   printf("CARNSTAT: %04X via socket %d\n\r", Eregs_Out[0x66], sockptr);
+   printf("CARNSTAT: %04X via socket %d" CRNL, Eregs_Out[0x66], sockptr);
    rc = send(sockptr, carnstat, 1, 0);
-   printf("CA1: Send %d bytes on socket %d\n\r", rc, sockptr);
+   printf("CA1: Send %d bytes on socket %d" CRNL, rc, sockptr);
    if (rc < 0) {
-      printf("\nCA1: CA status send to host failed...\n\r");
+      printf("\nCA1: CA status send to host failed..." CRNL);
       return;
    }
    // Wait for the ACK from the host
    rc = recv(sockptr, ackbuf, 1, 0);
-   printf("CA1: Ack received %02X on socket %d\n\r", *ackbuf, sockptr);
+   printf("CA1: Ack received %02X on socket %d" CRNL, *ackbuf, sockptr);
    Eregs_Out[0x66] = 0x0000;                      // Reset CA status bytes
 
    return;
@@ -236,7 +236,7 @@ int send_socket(int sockptr, char *respp, int respsize) {
    rc = send (sockptr, respp, respsize, 0);
 
    if (rc < 0) {
-      printf("\nCA1: Send to host failed...\n\r");
+      printf("\nCA1: Send to host failed..." CRNL);
       return -1;
    }
    return 0;
@@ -250,11 +250,11 @@ int open_socket(int *sockfd) {
    // SIMH socket creation
    *sockfd = socket(AF_INET, SOCK_STREAM, 0);
    if (*sockfd == -1) {
-      printf("\nCA1: TCP socket creation failed...\n\r");
+      printf("\nCA1: TCP socket creation failed..." CRNL);
       return(-1);
    }
    else
-      printf("\nCA1: TCP socket successfully created...\n\r");
+      printf("\nCA1: TCP socket successfully created..." CRNL);
    bzero(&servaddr, sizeof(servaddr));
 
    // Assign IP addr and PORT number
@@ -264,10 +264,10 @@ int open_socket(int *sockfd) {
 
    // Connect the SIMH socket to host socket
    while (connect(*sockfd, (SA*)&servaddr, sizeof(servaddr)) != 0) {
-      printf("\nCA1: SIMH --> HOST connection failed! Retrying in 10 sec...\n\r");
+      printf("\nCA1: SIMH --> HOST connection failed! Retrying in 10 sec..." CRNL);
       sleep(10);
    }
-   printf("\nCA1: SIMH succesfully connected with HOST...\n\r");
+   printf("\nCA1: SIMH succesfully connected with HOST..." CRNL);
    return(0);
 }
 
@@ -285,13 +285,13 @@ void *CA1_ATTN(void *arg) {
       if (((Eregs_Out[0x67] & 0x0040) == 0x0040) || ackbuf == 0xF8 ) {
          // Grab the lock to avoid sync issues
          pthread_mutex_lock(&lock);
-         printf("CA1: L3 register 67 %04X \n\r", Eregs_Out[0x67]);
+         printf("CA1: L3 register 67 %04X " CRNL, Eregs_Out[0x67]);
          Eregs_Inp[0x62] |= 0x0100;               // Set Program requested L3 interrupt
          Eregs_Inp[0x77] |= 0x0010;               // Set L3 Data Service Request
          CA1_DS_req_L3 = ON;                      // Chan Adap Data Service  request flag
          while (Ireg_bit(0x77, 0x0010) == ON) wait();
          Eregs_Out[0x67] &= ~0x0040;              // Reset L3 DS/ request
-         printf("CA1: Sending Return status\n\r");
+         printf("CA1: Sending Return status" CRNL);
          // Send CA retun status to host
          send_carnstat(iob->tag_socket, &carnstat, &ackbuf);
          // Release the lock
@@ -316,7 +316,7 @@ void *CA1_thread(void *arg) {
 
    // Init the lock
    if (pthread_mutex_init(&lock, NULL) !=0)  {
-      printf("CA1: Lock initialization failed \n\r");
+      printf("CA1: Lock initialization failed " CRNL);
       exit(EXIT_FAILURE);
    }
 
@@ -336,7 +336,7 @@ void *CA1_thread(void *arg) {
    // Set SIMH 3705 socket to allow multiple connections
    int flag = 1;
    if (-1 == setsockopt(iob.socket_3705, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag))) {
-      printf("\nCA1: Setsockopt failed\n\r");
+      printf("\nCA1: Setsockopt failed" CRNL);
    }
 
    // Bind the socket to localhost port PORT
@@ -345,7 +345,7 @@ void *CA1_thread(void *arg) {
       exit(EXIT_FAILURE);
    }
    // Now server is ready to listen
-   printf("CA1: TCP listener on port %d \n\r", PORT);
+   printf("CA1: TCP listener on port %d " CRNL, PORT);
 
    // Wait for ccw connection from host
    rc = host_connect(&iob, &iob.ccw_socket);
@@ -354,16 +354,16 @@ void *CA1_thread(void *arg) {
       // Get device number
       rc = read_socket( iob.ccw_socket, iob.buffer, sizeof(iob.buffer));
       iob.devnum = (iob.buffer[0] << 8) | iob.buffer[1];
-      printf("\nCA1: Connected to device %04X\n\r", iob.devnum);
+      printf("\nCA1: Connected to device %04X" CRNL, iob.devnum);
    }
 
    // Wait for tag connection from host
    rc = host_connect(&iob, &iob.tag_socket);
 
    if (rc == 0) {
-      printf("CA1: Attention connection established with host on socket %d\n\r", iob.tag_socket);
+      printf("CA1: Attention connection established with host on socket %d" CRNL, iob.tag_socket);
       pthread_create(&id, NULL, CA1_ATTN, &iob);
-      printf("CA1: Attention thread started succesfully... \n\r");
+      printf("CA1: Attention thread started succesfully... " CRNL);
    }
    Eregs_Inp[0x77] &= ~0x0018;           // Reset inital sel and  data/serv lvl3 interrupt
    CA1_DS_req_L3 = OFF;                  // Chan Adap Data/Status request flag
@@ -385,7 +385,7 @@ void *CA1_thread(void *arg) {
          // Host disconnected, get details and print it
          getpeername(iob.ccw_socket, (struct sockaddr*)&iob.address, \
                 (socklen_t*)&iob.addrlen);
-         printf("\nHost disconnected, IP: %s, port: %d \n\r",
+         printf("\nHost disconnected, IP: %s, port: %d " CRNL,
                 inet_ntoa(iob.address.sin_addr), ntohs(iob.address.sin_port));
 
          // Close the socket and mark as 0 in list for reuse
@@ -407,7 +407,7 @@ void *CA1_thread(void *arg) {
       ccw.count = (iob.buffer[6] << 8) | iob.buffer[7];
       Eregs_Inp[0x61] = ccw.code;           // Set Chan command in INSEADCM
 
-      printf("\nCA1: Channel Command: %02X, length: %d, Flags: %02X, Chained: %02X \n\r", ccw.code, ccw.count, ccw.flags, ccw.chain);
+      printf("\nCA1: Channel Command: %02X, length: %d, Flags: %02X, Chained: %02X " CRNL, ccw.code, ccw.count, ccw.flags, ccw.chain);
       /* Send an ACK to the host */
       send_ack(iob.ccw_socket);
 
@@ -482,7 +482,7 @@ void *CA1_thread(void *arg) {
             rc = send(iob.ccw_socket, (void*)&carnstat, 1, 0);
             // Wait for the ACK from the host
             recv_ack(iob.ccw_socket);
-            printf("CARNSTAT: %04X via socket %d\n\r", carnstat, iob.ccw_socket);
+            printf("CARNSTAT: %04X via socket %d" CRNL, carnstat, iob.ccw_socket);
             break;
 
          case 0x04:       // Sense ?
@@ -500,12 +500,12 @@ void *CA1_thread(void *arg) {
             switch (nobytes) {
                case 0x01:
                   data_buffer[0] = Eregs_Out[0x64] >> 8;     // Load sense data byte 0
-                  printf("CA1: Sending sense Byte 0 %02X \n\r", data_buffer[0]);
+                  printf("CA1: Sending sense Byte 0 %02X " CRNL, data_buffer[0]);
                   break;
                case 0x02:
                   data_buffer[0] = Eregs_Out[0x64] >> 8;     // Load sense data byte 0
                   data_buffer[1] = Eregs_Out[0x64] & 0x00FF; // Load sense data byte 1
-                  printf("CA1: Sending sense Byte 0 %02X, Byte 1 %02X \n\r",
+                  printf("CA1: Sending sense Byte 0 %02X, Byte 1 %02X " CRNL,
                          data_buffer[0], data_buffer[1]);
                   break;
             }
@@ -540,7 +540,7 @@ void *CA1_thread(void *arg) {
             // Read data from host
 
             rc = recv( iob.ccw_socket, iob.buffer, sizeof(iob.buffer), 0);
-            printf("CA1: received: %d  bytes from host\n\r", rc);
+            printf("CA1: received: %d  bytes from host" CRNL, rc);
             // Send an ACK to the host
             send_ack(iob.ccw_socket);
             iob.bufferl = rc;
@@ -590,16 +590,16 @@ void *CA1_thread(void *arg) {
                CA1_DS_req_L3 = ON;                           // Chan Adap Data Service request flag */
             }
 
-            printf("CA1: Data transfer complete...\n\r");
+            printf("CA1: Data transfer complete..." CRNL);
             while (Ireg_bit(0x77, 0x0010) == ON) wait();     // MIROS07 (See miniROS listing)
             Eregs_Inp[0x62] |= 0x0400;                       // Set channel stop
             Eregs_Inp[0X62] &= ~0x0007;                      // Set number of bytes transferred to 0
             Eregs_Inp[0x77] |= 0x0010;                       // Set data/serv lvl 3 interrupt
             CA1_DS_req_L3 = ON;                              // Chan Adap Data Service request flag
-            printf("CA1: Channel Stop\n\r");
+            printf("CA1: Channel Stop" CRNL);
 
             if (Eregs_Out[0x62] & 0x1000) {                  // Present Channel end
-               printf("CA1: Present NSC channel end status \n\r");
+               printf("CA1: Present NSC channel end status " CRNL);
                carnstat = (carnstat | CSW_CEND) | CSW_DEND;
             }
             else {

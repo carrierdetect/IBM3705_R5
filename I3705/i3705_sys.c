@@ -179,7 +179,7 @@ t_stat sim_load (FILE *fileref, char *cptr, char *fnam, int flag) {
          continue;                                    /* Next record please */
       }
    }
-   printf("\n\r");
+   printf(CRNL);
    printf ("%d Bytes loaded. Last byte stored at loc %05X.\n", i, addr-1);
    return (SCPE_OK);
 }

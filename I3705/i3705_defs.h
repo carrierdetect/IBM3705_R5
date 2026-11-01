@@ -97,6 +97,31 @@ struct opdef {
 
 #define MAXHOSTS 2
 #define MAXCHAN  2                                      /* Max channels */
+/*
+ * CRNL: HOW A LINE ENDS, AND WHY IT IS NOT ALWAYS "\n\r" (2026-11-01).
+ *
+ * SIMH's console wants a carriage return as well as a newline. Genode's LOG
+ * does not: it prefixes every message with the component that wrote it and
+ * ends the line itself, so a trailing "\r" STRANDS THE NEXT MESSAGE'S
+ * "[init -> x]" prefix on a line of its own and that message arrives
+ * anonymous. Found 2026-10-22 when a per-controller grep reported one trace
+ * facility for 3705a where three were open, and all 2,252 of a boot's
+ * instrument lines turned out to be unattributed -- which with a controller
+ * PAIR mixes two of them into one mean (829 scan cycles/s at 45% standard
+ * deviation; split by pairing each line with the prefix above it, 834 and
+ * 824).
+ *
+ * The scanner's own instrument fixed this with SP_CR at the FRONT of each
+ * format string. These 122 sites carry the pair at the END instead, so they
+ * take a macro for the ending itself. Same rule either way: on Genode a line
+ * ends with a newline and nothing else.
+ */
+#if defined(__GENODE__)
+#define CRNL "\n"
+#else
+#define CRNL "\n\r"
+#endif
+
 #define MAX_LINES   4                                   /* Maximum number of  lines */
 
 /* IBM 3705 I/O structure   */
