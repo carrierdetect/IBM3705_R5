@@ -1139,6 +1139,16 @@ void *CAx_thread(void *arg) {
                 */
                if (sp_probe_armed && (++ca_probe_cyc % 50) == 0) {
                   xlink_poll_probe(1, 0);
+                  /*
+                   * TAG 4, BACK TO BACK: tag 1 follows this thread's own 10 ms
+                   * TIMED poll, and tag 4 follows tag 1's bare ZERO-timeout
+                   * one. Same thread, same zero distance, only the preceding
+                   * poll's timeout differs -- which is the scanner's condition
+                   * reproduced here, and the other diagonal of the 2x2 in
+                   * port/genode/xlink/genode_xlink.h. It goes BEFORE the timed
+                   * probe below so that what precedes it is never a 10 ms wait.
+                   */
+                  xlink_poll_probe(4, 0);
                   if ((ca_probe_cyc % 200) == 0)
                      xlink_poll_probe(1, 10);
                }

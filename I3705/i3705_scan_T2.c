@@ -1267,6 +1267,14 @@ void *CS2_thread(void *arg) {
             extern void xlink_poll_probe(int tag, int timeout_ms);
             uint64_t const pp0 = sp_tsc();
             xlink_poll_probe(2, 0);
+            /*
+             * TAG 5, BACK TO BACK: tag 2 follows this thread's own line poll,
+             * and tag 5 follows tag 2's bare ZERO-timeout poll. Same thread,
+             * same zero distance, and the preceding poll's timeout is the only
+             * thing that differs from tag 3's condition. It is also tag 2's
+             * consistency check: two samples of one condition that must agree.
+             */
+            xlink_poll_probe(5, 0);
             sp_probe_debt += sp_tsc() - pp0;
          }
 #endif
@@ -1387,6 +1395,22 @@ void *CS2_thread(void *arg) {
                sp_probe_armed = 1;
                if ((sp_probe_cyc %  250) == 0) { xlink_poll_probe(0,  0); probed = 1; }
                if ((sp_probe_cyc % 2000) == 0) { xlink_poll_probe(0, 10); probed = 1; }
+               /*
+                * TAG 3: THE CHANNEL ADAPTER'S CONDITION, ON THIS THREAD. The
+                * pair is the experiment -- probe(3,10) is the SETUP, a 10 ms
+                * timed poll like the adapter's, and probe(3,0) immediately
+                * after it is the MEASUREMENT. If a thread woken by the
+                * entrypoint's own timer handling resumes inside its drain
+                * pass, this is where that shows up, and it costs the scanner
+                * its 10 ms at the same 250-cycle interval as tags 0 and 2 so
+                * all three are a paired comparison at one rate. Registered
+                * cost: about 42 us a cycle idle, ~7% of the scanner's rate.
+                */
+               if ((sp_probe_cyc %  250) == 0) {
+                  xlink_poll_probe(3, 10);
+                  xlink_poll_probe(3,  0);
+                  probed = 1;
+               }
                sp_probe_cyc++;
                if (probed) sp_last = sp_tsc();
             }
@@ -1514,10 +1538,12 @@ void *CS2_thread(void *arg) {
                                                           unsigned long *,
                                                           unsigned long long *,
                                                           unsigned long long *);
-                        static char const *tgname[3] = { "scan", "ca", "scanpost" };
+                        static char const *tgname[6] = {
+                           "scan", "ca", "scanpost",
+                           "scanaft10", "cabtb", "scanbtb" };
                         int tg, wh;
                         SP_REPORT(SP_CR "POLLRT:");
-                        for (tg = 0; tg < 3; tg++)
+                        for (tg = 0; tg < 6; tg++)
                            for (wh = 0; wh < 2; wh++) {
                               unsigned long      c  = 0;
                               unsigned long long tt = 0, mx = 0;
