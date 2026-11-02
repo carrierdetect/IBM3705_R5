@@ -241,13 +241,21 @@ static uint64_t sp_sleep, sp_body, sp_cycles, sp_last;
  * four more is ~0.05 us against a 590 us cycle.
  */
 static uint64_t sp_sw[MAX_LINES], sp_post[MAX_LINES], sp_split_cyc;
+/*
+ * POLLRT's mid-body probe pays what it measures and the payment lands inside
+ * sp_body, which is a figure the cell compares against. It is subtracted back
+ * out below. Defined unconditionally because the subtraction is: a variable
+ * declared under __GENODE__ and used outside it is how this fork's native
+ * build stayed broken for twenty days.
+ */
+static uint64_t sp_probe_debt;
 #if defined(__GENODE__)
 /*
  * POLLRT: the bare round-trip probe's cycle counter, and the gate the channel
  * adapter reads so its own probe is armed by the same debug bit without that
  * file needing the scanner's register variables.
  */
-static uint64_t sp_probe_cyc;
+static uint64_t sp_probe_cyc, sp_probe_post_cyc;
 int             sp_probe_armed;
 #endif
 static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
@@ -1242,6 +1250,26 @@ void *CS2_thread(void *arg) {
          }  // End of switch (icw_pcf[line])
          uint64_t const bs_t1 = sp_tsc();
          sp_sw[line] += bs_t1 - bs_t0;
+#if defined(__GENODE__)
+         /*
+          * POLLRT, THE SECOND PHASE. The same bare round-trip probe as the one
+          * at the top of the body, taken here instead: immediately after this
+          * line's state machine -- and so after its poll of the line crosslink
+          * -- has returned. That is the phase the channel adapter's probe has
+          * always sampled, the instant the entrypoint has just finished
+          * serving THIS thread. Tag 0 samples an arbitrary phase and tag 1 the
+          * adapter's; without tag 2 the 40 us the adapter measures cannot be
+          * told apart from a per-thread difference. Line 0 only, so the
+          * interval means the same thing as tag 0's.
+          */
+         if (line == 0 && sp_probe_armed
+             && (sp_probe_post_cyc++ % 250) == 0) {
+            extern void xlink_poll_probe(int tag, int timeout_ms);
+            uint64_t const pp0 = sp_tsc();
+            xlink_poll_probe(2, 0);
+            sp_probe_debt += sp_tsc() - pp0;
+         }
+#endif
          //pthread_mutex_unlock(&icw_lock);
 
 
@@ -1323,7 +1351,8 @@ void *CS2_thread(void *arg) {
          {
             uint64_t const t1 = sp_tsc();
             sp_sleep += t1 - t0;
-            if (sp_last) sp_body += t0 - sp_last;
+            if (sp_last) sp_body += t0 - sp_last - sp_probe_debt;
+            sp_probe_debt = 0;
             sp_last = t1;
             tw_count[0]++;
             sp_split_cyc++;                          /* BODYSPLIT's denominator */
@@ -1485,15 +1514,16 @@ void *CS2_thread(void *arg) {
                                                           unsigned long *,
                                                           unsigned long long *,
                                                           unsigned long long *);
+                        static char const *tgname[3] = { "scan", "ca", "scanpost" };
                         int tg, wh;
                         SP_REPORT(SP_CR "POLLRT:");
-                        for (tg = 0; tg < 2; tg++)
+                        for (tg = 0; tg < 3; tg++)
                            for (wh = 0; wh < 2; wh++) {
                               unsigned long      c  = 0;
                               unsigned long long tt = 0, mx = 0;
                               xlink_poll_probe_stats(tg, wh, &c, &tt, &mx);
                               SP_REPORT(" %s/%s=%lu/%.0f/%.0f",
-                                        tg ? "ca" : "scan",
+                                        tgname[tg],
                                         wh ? "t10" : "t0", c,
                                         c ? tt/(double)c/sp_tsc_mhz() : 0.0,
                                         mx/sp_tsc_mhz());
