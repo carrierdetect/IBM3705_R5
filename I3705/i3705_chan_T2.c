@@ -23,9 +23,12 @@
 */
 
 #include "sim_defs.h"
-#if defined(__GENODE__)
+/* NOT Genode-only: defined unconditionally in i3705_cpu.c, registered in its
+   DRDATA table, and used below outside every guard. These two declarations
+   sat inside the __GENODE__ block that follows and broke the native build. */
 extern int16 CaStallSecs;   /* deposit CASTALL <s> in the .cnf; 0 = unbounded */
 extern int16 CaFaultSecs;   /* deposit CAFAULT <s> in the .cnf; 0 = off     */
+#if defined(__GENODE__)
 extern void genode_pace_us(unsigned us);       /* the SCANNER's connection */
 extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
    NOT genode_pace_us: that one is the scanner's connection, and

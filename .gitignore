@@ -1,0 +1,13 @@
+# The simulator makefile's output directory (makefile: BIN = BIN/, and every
+# target invokes MKDIRBIN, so a clone without it builds fine). Five binaries
+# were committed into it by accident; a build product in the tree is a second
+# source of truth for something the makefile already produces, and it leaves
+# the tree permanently dirty after any build, which is how a real uncommitted
+# change went unnoticed through an end-of-session clean-tree check.
+BIN/
+
+# Precompiled headers. Upstream shipped sim_console.h.gch and it was removed
+# in "Remove the checked-in precompiled header": on a fresh clone it is newer
+# than its source, so gcc silently prefers it and a patched header has no
+# effect at all.
+*.gch
