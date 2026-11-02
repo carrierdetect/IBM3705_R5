@@ -1401,12 +1401,33 @@ void *CS2_thread(void *arg) {
                      unsigned long      pc = 0;
                      unsigned long long pt = 0, pm = 0;
                      xlink_poll_stats(&pc, &pt, &pm);
-                     SP_REPORT(SP_CR "POLLUS: calls=%lu us/call=%.2f max=%.0f us"
-                                     " per-cycle=%.1f us\n",
+                     SP_REPORT(SP_CR "POLLUS: calls=%lu us/call=%.2f max=%.0f us\n",
                                pc,
                                pc ? pt/(double)pc/sp_tsc_mhz() : 0.0,
-                               pm/sp_tsc_mhz(),
-                               sp_split_cyc ? pt/(double)sp_split_cyc/sp_tsc_mhz() : 0.0);
+                               pm/sp_tsc_mhz());
+                     /*
+                      * PER DESCRIPTOR, which is what tells the channel
+                      * crosslink's poll from the line's. "per-cycle" was
+                      * dropped: this counter is shared across the component's
+                      * threads and the scanner's cycle count is not its
+                      * denominator -- see the results file.
+                      */
+                     {
+                        extern int xlink_poll_fd_stats(int, unsigned long *,
+                                                       unsigned long long *,
+                                                       unsigned long long *);
+                        int fd;
+                        SP_REPORT(SP_CR "POLLFD:");
+                        for (fd = 0; fd < 32; fd++) {
+                           unsigned long      c = 0;
+                           unsigned long long t = 0, mx = 0;
+                           if (!xlink_poll_fd_stats(fd, &c, &t, &mx)) continue;
+                           if (!c) continue;
+                           SP_REPORT(" %d=%lu/%.0f/%.0f", fd, c,
+                                     t/(double)c/sp_tsc_mhz(), mx/sp_tsc_mhz());
+                        }
+                        SP_REPORT(" (fd=calls/us-mean/us-max)\n");
+                     }
                   }
 #endif
                   {  /* BODYSPLIT, per line, in us per cycle */
