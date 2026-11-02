@@ -29,6 +29,13 @@
 extern int16 CaStallSecs;   /* deposit CASTALL <s> in the .cnf; 0 = unbounded */
 extern int16 CaFaultSecs;   /* deposit CAFAULT <s> in the .cnf; 0 = off     */
 #if defined(__GENODE__)
+/* POLLRT, see the use below and port/genode/xlink/genode_xlink.h. Genode-only
+   in every part: the probe is the port's, and sp_probe_armed is set by the
+   scanner only under the same debug bit. */
+extern void          xlink_poll_probe(int tag, int timeout_ms);
+extern int           sp_probe_armed;
+static unsigned long ca_probe_cyc;
+
 extern void genode_pace_us(unsigned us);       /* the SCANNER's connection */
 extern void genode_chan_pace_us(unsigned us);  /* Timer session, microseconds.
    NOT genode_pace_us: that one is the scanner's connection, and
@@ -1115,6 +1122,26 @@ void *CAx_thread(void *arg) {
                tw_count[3]++;
                did_work = 1;   /* the 10 ms poll below paces the loop */
                pendingrcv = genode_ca_avail(iobs[j]->bus_socket[iobs[j]->abswitch], 10);
+               /*
+                * POLLRT FROM THIS THREAD, which is the discriminator the
+                * scanner's copy cannot be. The poll above is a monitor round
+                * trip plus a 10 ms timed leg and the scanner's line poll is a
+                * round trip alone; whether those round trips are the same
+                * size decides whether the two costs are one delay or two.
+                * Armed by the scanner so this file needs none of its register
+                * variables, and sampled every 50th iteration -- about once a
+                * second -- because under a spinning neighbour each probe pays
+                * what it measures. See port/genode/xlink/genode_xlink.h.
+                *
+                * Two adapters may run this, sharing the counter; the race is
+                * benign for an instrument and the two are reported together
+                * under one tag, which is what the question asks.
+                */
+               if (sp_probe_armed && (++ca_probe_cyc % 50) == 0) {
+                  xlink_poll_probe(1, 0);
+                  if ((ca_probe_cyc % 200) == 0)
+                     xlink_poll_probe(1, 10);
+               }
 #else
                ioctl(iobs[j]->bus_socket[iobs[j]->abswitch], FIONREAD, &pendingrcv);
 #endif

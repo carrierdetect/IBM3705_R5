@@ -241,6 +241,15 @@ static uint64_t sp_sleep, sp_body, sp_cycles, sp_last;
  * four more is ~0.05 us against a 590 us cycle.
  */
 static uint64_t sp_sw[MAX_LINES], sp_post[MAX_LINES], sp_split_cyc;
+#if defined(__GENODE__)
+/*
+ * POLLRT: the bare round-trip probe's cycle counter, and the gate the channel
+ * adapter reads so its own probe is armed by the same debug bit without that
+ * file needing the scanner's register variables.
+ */
+static uint64_t sp_probe_cyc;
+int             sp_probe_armed;
+#endif
 static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
 
 /* SCANSPIN=1: pace with a bounded rdtsc spin instead of a timer sleep.
@@ -1318,6 +1327,41 @@ void *CS2_thread(void *arg) {
             sp_last = t1;
             tw_count[0]++;
             sp_split_cyc++;                          /* BODYSPLIT's denominator */
+#if defined(__GENODE__)
+            /*
+             * POLLRT: SAMPLE A BARE ENTRYPOINT ROUND TRIP, AT A CYCLE
+             * INTERVAL. See port/genode/xlink/genode_xlink.h: a poll with
+             * nfds 0 looks up no descriptor and does no plugin work, so it
+             * times the libc's monitor round trip alone, and the same probe
+             * with a timeout times the round trip plus the WHOLE timed leg
+             * because nothing can become ready to cut it short. Those are the
+             * two parts of every xlink_avail, and no instrument inside the
+             * shim can separate them.
+             *
+             * INTERVALS, NOT EVERY CYCLE, because the probe pays what it
+             * measures: with a partition spinning on the crosslinks' core the
+             * zero-timeout probe costs about 16.7 ms and the timed one about
+             * 27 ms. At these rates that is ~0.4% of the scanner's time under
+             * such a burn, and ~0.8% idle, where the 10 ms probe is the
+             * expensive one against a 596 us cycle.
+             *
+             * AND sp_last IS RESET AFTER IT, which matters more than it looks:
+             * sp_body is accumulated from sp_last to the start of the next
+             * cycle's wait, so without this the probe's own cost would land in
+             * the NEXT cycle's body and inflate -- by about 40% in one report
+             * in four when idle -- the very figure the probe exists to be
+             * compared against.
+             */
+            if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08)) {
+               extern void xlink_poll_probe(int tag, int timeout_ms);
+               int probed = 0;
+               sp_probe_armed = 1;
+               if ((sp_probe_cyc %  250) == 0) { xlink_poll_probe(0,  0); probed = 1; }
+               if ((sp_probe_cyc % 2000) == 0) { xlink_poll_probe(0, 10); probed = 1; }
+               sp_probe_cyc++;
+               if (probed) sp_last = sp_tsc();
+            }
+#endif
             if (++sp_cycles >= 500) {
                if ((Sdbg_flag == ON) && (Sdbg_reg & 0x08)) {
                   static uint64_t tw_last = 0;
@@ -1427,6 +1471,34 @@ void *CS2_thread(void *arg) {
                                      t/(double)c/sp_tsc_mhz(), mx/sp_tsc_mhz());
                         }
                         SP_REPORT(" (fd=calls/us-mean/us-max)\n");
+                     }
+                     /*
+                      * POLLRT: the same round trip measured BARE, from the
+                      * scanner's thread and from a channel adapter's. If it
+                      * costs the same on both, the line's whole poll cost and
+                      * the channel pair's increase are one delay seen twice;
+                      * if it does not, they are two, and the difference is
+                      * per thread.
+                      */
+                     {
+                        extern int xlink_poll_probe_stats(int, int,
+                                                          unsigned long *,
+                                                          unsigned long long *,
+                                                          unsigned long long *);
+                        int tg, wh;
+                        SP_REPORT(SP_CR "POLLRT:");
+                        for (tg = 0; tg < 2; tg++)
+                           for (wh = 0; wh < 2; wh++) {
+                              unsigned long      c  = 0;
+                              unsigned long long tt = 0, mx = 0;
+                              xlink_poll_probe_stats(tg, wh, &c, &tt, &mx);
+                              SP_REPORT(" %s/%s=%lu/%.0f/%.0f",
+                                        tg ? "ca" : "scan",
+                                        wh ? "t10" : "t0", c,
+                                        c ? tt/(double)c/sp_tsc_mhz() : 0.0,
+                                        mx/sp_tsc_mhz());
+                           }
+                        SP_REPORT(" (thread/timeout=calls/us-mean/us-max)\n");
                      }
                   }
 #endif
