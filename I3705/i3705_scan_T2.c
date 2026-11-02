@@ -1556,6 +1556,42 @@ void *CS2_thread(void *arg) {
                            }
                         SP_REPORT(" (thread/timeout=calls/us-mean/us-max)\n");
                      }
+                     /*
+                      * MONQ: THE LIBC'S MONITOR QUEUE, which is where the
+                      * probes above ran out of road. They showed the round
+                      * trip's cost is neither the thread's nor the call's, so
+                      * what is left is what the entrypoint had queued when it
+                      * finished the previous job -- and no instrument in a
+                      * caller can see that. Binned by the number of
+                      * examination PASSES a job waited: bin 0 is a job the
+                      * pass its own trigger caused executed, and a dear round
+                      * trip should not be in it.
+                      */
+                     {
+                        extern unsigned xlink_monq_stats(
+                           unsigned long long *, unsigned long long *,
+                           unsigned long long *, unsigned long long *,
+                           unsigned long long *, unsigned long long *,
+                           unsigned long long *, unsigned long long *);
+                        unsigned long long pas = 0, exa = 0, cmp = 0, exmax = 0;
+                        unsigned long long bc[8] = {0}, bt[8] = {0},
+                                           bm[8] = {0}, ba[8] = {0};
+                        unsigned nb = xlink_monq_stats(&pas, &exa, &cmp, &exmax,
+                                                       bc, bt, bm, ba);
+                        unsigned bi;
+                        static char const *bname[6] =
+                           { "0", "1", "2", "3", "4-7", "8+" };
+                        SP_REPORT(SP_CR "MONQ: passes=%llu examined=%llu "
+                                        "completed=%llu pass_max=%llu",
+                                  pas, exa, cmp, exmax);
+                        for (bi = 0; bi < nb && bi < 6; bi++)
+                           SP_REPORT(" w%s=%llu/%.0f/%.0f/%.1f",
+                                     bname[bi], bc[bi],
+                                     bc[bi] ? bt[bi]/(double)bc[bi]/sp_tsc_mhz() : 0.0,
+                                     bm[bi]/sp_tsc_mhz(),
+                                     bc[bi] ? ba[bi]/(double)bc[bi] : 0.0);
+                        SP_REPORT(" (waited=jobs/us-mean/us-max/ahead-mean)\n");
+                     }
                   }
 #endif
                   {  /* BODYSPLIT, per line, in us per cycle */
