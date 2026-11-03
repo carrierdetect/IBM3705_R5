@@ -1566,6 +1566,17 @@ void *CS2_thread(void *arg) {
                       * examination PASSES a job waited: bin 0 is a job the
                       * pass its own trigger caused executed, and a dear round
                       * trip should not be in it.
+                      *
+                      * THE BINS NEED ASKING FOR. Filling them costs two
+                      * serialising timestamp reads per job inside the libc, so
+                      * the Genode fork gates them on this component's
+                      * `<libc monitor_stats="yes"/>` and defaults them OFF. An
+                      * off instrument returns the same zeroed bins as a queue
+                      * that saw no traffic, so this prints `bins=off` and no
+                      * table at all rather than a row of zeros a reader could
+                      * score. The three counters before it are not gated and
+                      * are printed either way -- the pass RATE is what
+                      * identified the starvation, and it costs an increment.
                       */
                      {
                         extern unsigned xlink_monq_stats(
@@ -1573,6 +1584,7 @@ void *CS2_thread(void *arg) {
                            unsigned long long *, unsigned long long *,
                            unsigned long long *, unsigned long long *,
                            unsigned long long *, unsigned long long *);
+                        extern int xlink_monq_enabled(void);
                         unsigned long long pas = 0, exa = 0, cmp = 0, exmax = 0;
                         unsigned long long bc[8] = {0}, bt[8] = {0},
                                            bm[8] = {0}, ba[8] = {0};
@@ -1584,13 +1596,19 @@ void *CS2_thread(void *arg) {
                         SP_REPORT(SP_CR "MONQ: passes=%llu examined=%llu "
                                         "completed=%llu pass_max=%llu",
                                   pas, exa, cmp, exmax);
-                        for (bi = 0; bi < nb && bi < 6; bi++)
-                           SP_REPORT(" w%s=%llu/%.0f/%.0f/%.1f",
-                                     bname[bi], bc[bi],
-                                     bc[bi] ? bt[bi]/(double)bc[bi]/sp_tsc_mhz() : 0.0,
-                                     bm[bi]/sp_tsc_mhz(),
-                                     bc[bi] ? ba[bi]/(double)bc[bi] : 0.0);
-                        SP_REPORT(" (waited=jobs/us-mean/us-max/ahead-mean)\n");
+                        if (!xlink_monq_enabled()) {
+                           SP_REPORT(" bins=off"
+                                     " (per-job timing not enabled;"
+                                     " <libc monitor_stats=\"yes\"/>)\n");
+                        } else {
+                           for (bi = 0; bi < nb && bi < 6; bi++)
+                              SP_REPORT(" w%s=%llu/%.0f/%.0f/%.1f",
+                                        bname[bi], bc[bi],
+                                        bc[bi] ? bt[bi]/(double)bc[bi]/sp_tsc_mhz() : 0.0,
+                                        bm[bi]/sp_tsc_mhz(),
+                                        bc[bi] ? ba[bi]/(double)bc[bi] : 0.0);
+                           SP_REPORT(" (waited=jobs/us-mean/us-max/ahead-mean)\n");
+                        }
                      }
                   }
 #endif
