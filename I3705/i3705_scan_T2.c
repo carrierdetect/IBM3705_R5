@@ -1512,18 +1512,91 @@ void *CS2_thread(void *arg) {
                      {
                         extern int xlink_poll_fd_stats(int, unsigned long *,
                                                        unsigned long long *,
+                                                       unsigned long long *,
+                                                       unsigned long *,
+                                                       unsigned long long *,
                                                        unsigned long long *);
+                        /*
+                         * SNAPSHOT EVERY DESCRIPTOR FIRST, PRINT AFTERWARDS.
+                         * The accessor resets what it returns so that no
+                         * reader can double count, which means POLLFD and
+                         * POLLRDY below cannot each call it: the second would
+                         * read zeros and print a table of noughts that reads
+                         * exactly like "nothing ever completes".
+                         *
+                         * static rather than on the stack. Thirty-two rows of
+                         * this is over 2 KB, and a big local is one of the
+                         * four documented ways to kill a component on this
+                         * platform; only the scanner's thread reaches here.
+                         */
+                        static struct {
+                           int                tracked;
+                           unsigned long      c, oc[2];
+                           unsigned long long t, ot[2];
+                           unsigned long long mx, om[2];
+                        } fds[32];
                         int fd;
+                        for (fd = 0; fd < 32; fd++) {
+                           fds[fd].tracked = 0;
+                           fds[fd].c = 0; fds[fd].t = 0; fds[fd].mx = 0;
+                           fds[fd].oc[0] = fds[fd].oc[1] = 0;
+                           fds[fd].ot[0] = fds[fd].ot[1] = 0;
+                           fds[fd].om[0] = fds[fd].om[1] = 0;
+                           fds[fd].tracked =
+                              xlink_poll_fd_stats(fd, &fds[fd].c, &fds[fd].t,
+                                                  &fds[fd].mx, fds[fd].oc,
+                                                  fds[fd].ot, fds[fd].om);
+                        }
                         SP_REPORT(SP_CR "POLLFD:");
                         for (fd = 0; fd < 32; fd++) {
-                           unsigned long      c = 0;
-                           unsigned long long t = 0, mx = 0;
-                           if (!xlink_poll_fd_stats(fd, &c, &t, &mx)) continue;
-                           if (!c) continue;
-                           SP_REPORT(" %d=%lu/%.0f/%.0f", fd, c,
-                                     t/(double)c/sp_tsc_mhz(), mx/sp_tsc_mhz());
+                           if (!fds[fd].tracked || !fds[fd].c) continue;
+                           SP_REPORT(" %d=%lu/%.0f/%.0f", fd, fds[fd].c,
+                                     fds[fd].t/(double)fds[fd].c/sp_tsc_mhz(),
+                                     fds[fd].mx/sp_tsc_mhz());
                         }
                         SP_REPORT(" (fd=calls/us-mean/us-max)\n");
+                        /*
+                         * POLLRDY: THE SAME CALLS, SPLIT BY OUTCOME.
+                         *
+                         * A channel descriptor's POLLFD mean is two
+                         * populations in one number -- polls that expired on
+                         * their 10 ms timeout, and polls that returned early
+                         * because a channel program arrived and that go on to
+                         * drain ~187 of them. The mean is (1-p)*e + p*c with
+                         * the completing fraction p unmeasured, and on
+                         * 2026-11-04 that cost a published figure its life.
+                         * These two groups are each measured directly, which
+                         * also makes the completing cost independent of this
+                         * very report's cadence: a block is emitted every 500
+                         * scanner cycles, so it spans 0.34 s beside idle
+                         * partitions and ~8 s once the scanner has collapsed,
+                         * and p falls across that for no reason of cost.
+                         *
+                         * The last field is a CLOSED ACCOUNTING over counters
+                         * the shim maintains independently of the totals
+                         * beside them: the two groups must sum to POLLFD's
+                         * calls and to its time, or the split is wrong and
+                         * nothing derived from it is evidence.
+                         */
+                        SP_REPORT(SP_CR "POLLRDY:");
+                        for (fd = 0; fd < 32; fd++) {
+                           int ok;
+                           if (!fds[fd].tracked || !fds[fd].c) continue;
+                           ok = (fds[fd].oc[0] + fds[fd].oc[1] == fds[fd].c)
+                             && (fds[fd].ot[0] + fds[fd].ot[1] == fds[fd].t);
+                           SP_REPORT(" %d=%lu/%.0f/%.0f,%lu/%.0f/%.0f,%s", fd,
+                              fds[fd].oc[1],
+                              fds[fd].oc[1] ? fds[fd].ot[1]/(double)fds[fd].oc[1]
+                                              /sp_tsc_mhz() : 0.0,
+                              fds[fd].om[1]/sp_tsc_mhz(),
+                              fds[fd].oc[0],
+                              fds[fd].oc[0] ? fds[fd].ot[0]/(double)fds[fd].oc[0]
+                                              /sp_tsc_mhz() : 0.0,
+                              fds[fd].om[0]/sp_tsc_mhz(),
+                              ok ? "ok" : "BAD");
+                        }
+                        SP_REPORT(" (fd=completed-calls/us-mean/us-max,"
+                                  "expired-calls/us-mean/us-max,accounting)\n");
                      }
                      /*
                       * POLLRT: the same round trip measured BARE, from the
