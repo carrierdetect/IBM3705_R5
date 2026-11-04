@@ -1190,17 +1190,26 @@ static void commadpt_query_device (DEVBLK *dev, char **class,
     * device's own fields, so the names are short and nothing is a mean --
     * the reader divides, which is also how it gets a windowed mean rather
     * than a lifetime one.
+    *
+    * AND NO TRAILING NEWLINE, unlike the native string below. `devlist_cmd`
+    * composes one message out of this buffer plus the device's open/busy
+    * flags (hsccmd.c:6239) and hands the lot to WRMSG, so an embedded
+    * newline splits the Genode LOG line in two and the SECOND HALF CARRIES
+    * NO `[init -> lpar/x]` PREFIX. Every tool in the lab that separates one
+    * partition's output from another's matches on that prefix, so a figure
+    * on the far side of the newline belongs to no partition. The native
+    * string keeps its newline so that nothing about the native build changes.
     */
    if (dev->commadpt->attn_poll_untracked) {
       snprintf(buffer, buflen,
-               "Read count=%d, Write count=%d, POLLATTN untracked fd=%d\n",
+               "Read count=%d, Write count=%d, POLLATTN untracked fd=%d",
                dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count,
                dev->commadpt->tagfd);
       return;
    }
    snprintf(buffer, buflen,
             "Read count=%d, Write count=%d,"
-            " POLLATTN c=%lu/%lu us=%llu/%llu mx=%llu/%llu attn=%lu\n",
+            " POLLATTN c=%lu/%lu us=%llu/%llu mx=%llu/%llu attn=%lu",
             dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count,
             dev->commadpt->attn_poll_calls[1], dev->commadpt->attn_poll_calls[0],
             dev->commadpt->attn_poll_us[1], dev->commadpt->attn_poll_us[0],
