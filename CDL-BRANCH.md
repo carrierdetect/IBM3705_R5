@@ -120,6 +120,20 @@ checked-in precompiled header, `sim_console.h.gch`: on a fresh clone it is
 newer than `sim_console.h`, so gcc prefers it and edits to the header silently
 have no effect.
 
+Two commits untrack run products that were committed by accident, and both are
+the same defect rather than tidiness. `25cfa93` removes the five native
+binaries from `BIN/`, the makefile's own output directory — untracking them is
+what exposed a native build that had been broken for twenty days, because the
+stale artefact satisfied the gate that would have invoked the build. *"Stop
+tracking the simulator's debug trace files"* removes `trace.log`,
+`trace_3271.log`, `trace_A.log` and `trace_S.log`, each of them opened for
+writing when a `d debug*` command turns tracing on and never read back by
+anything. The cost in both cases is the same and it is not disk: a tree that
+is dirty after every run makes "the tree is clean" an answer nobody can rely
+on, and a real uncommitted change has already hidden behind one. Nothing was
+removed from history in either commit, so every revision this fork has been
+pinned at still resolves and still carries the files.
+
 ## What this fork is not
 
 It is **not** a proposed upstream series and has not been submitted. Prose

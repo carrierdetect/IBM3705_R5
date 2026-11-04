@@ -11,3 +11,17 @@ BIN/
 # than its source, so gcc silently prefers it and a patched header has no
 # effect at all.
 *.gch
+
+# The simulator's debug trace files. Every one of these is opened
+# `fopen(name, "w")` (or the port's `genode_trc_open`) when a `d debug*`
+# command turns tracing on, and nothing ever reads one back, so each is a run
+# product written into whatever directory the simulator was started in --
+# which, for the native build, is this tree. Four of them were tracked
+# (`trace.log`, `trace_3271.log`, `trace_A.log` empty, `trace_S.log` holding a
+# 16/10/2026 scanner header), so any run with tracing on left the tree dirty.
+# That is the same defect as the committed `BIN/` above and it cost the same
+# thing: an end-of-session "the tree is clean" check that cannot answer, with
+# a real uncommitted change sitting right through it. The pattern covers all
+# seven names the source opens -- the 3274, DLSw and Trunk ones were simply
+# never committed yet.
+trace*.log
