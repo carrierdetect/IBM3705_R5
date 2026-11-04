@@ -129,6 +129,8 @@ static BYTE commadpt_immed_command[256]=
 
 #include <poll.h>
 
+#include "genode_xlink.h"
+
 static int ipc_write(int fd, const void *buf, int len)
 {
     const char *p = (const char*) buf;
@@ -159,33 +161,45 @@ static int ipc_read(int fd, void *buf, int len)
 }
 
 /*
- * Is there anything to read, without blocking to find out.
+ * WHY THE ATTENTION THREAD POLLS AT ALL, which is the part worth keeping.
  *
- * The attention thread waits on the tag for the life of the device, and on
- * Genode a thread parked in a blocking VFS read is not free: the libc has one
- * context to service everybody, and the emulator's 3270 console devices reach
- * their clients through lwIP on that same libc. DASD does not -- it is a
- * Block session -- so an MVS IPL completes normally and only the console path
+ * That thread waits on the tag for the life of the device, and on Genode a
+ * thread parked in a blocking VFS read is not free: the libc has one context
+ * to service everybody, and the emulator's 3270 console devices reach their
+ * clients through lwIP on that same libc. DASD does not -- it is a Block
+ * session -- so an MVS IPL completes normally and only the console path
  * starves, which is why this surfaced as
  *
  *     IST093I  AJRP     ACTIVE
  *
  * and then silence: VTAM activating L3274, the local non-SNA major node for
  * the 3270s at 00C0-00C6, with nothing able to answer it.
+ *
+ * It used to poll with a LOCAL `ipc_avail`, a static function in this file
+ * carrying its own `poll(&p, 1, 0)`, followed by `usleep(10000)`. That is
+ * gone, and the loop below calls `xlink_avail` instead. Two reasons, and
+ * only the second is a saving:
+ *
+ *   IT WAS UNCOUNTABLE. Three instruments for crosslink polling were built
+ *   in four days -- POLLUS, POLLFD, POLLRDY -- and every one of them counts
+ *   calls that pass through xlink_avail. A poll written out longhand here is
+ *   invisible to all three, and this is the only poll in the system on the
+ *   attention path: everything the host learns from the controller arrives
+ *   behind it.
+ *
+ *   IT LEARNED LATE. The sleep is not woken by the crosslink, so a status
+ *   byte that arrived 50 us into the sleep waited out the remaining 9,950 --
+ *   up to 10 ms per attention, about 5 ms expected. A poll WITH a timeout
+ *   blocks in the libc's monitor and the terminal's read_avail signal
+ *   completes it, so the attention is raised when the byte arrives.
+ *
+ * The call count does NOT change: `poll(fd,1,0)` is a monitor round trip run
+ * on the component's entrypoint and `usleep` is a timed monitor leg
+ * (libports/src/lib/libc/sleep.cc), which is exactly the two halves of one
+ * `poll(fd,1,10)`. This is a latency fix and an instrument, not a cheaper
+ * loop, and port/results/comm3705-attn-poll-prediction.txt registers it that
+ * way.
  */
-static int ipc_avail(int fd)
-{
-    struct pollfd p;
-
-    if (fd < 0) return 0;
-
-    p.fd = fd; p.events = POLLIN; p.revents = 0;
-
-    if (poll( &p, 1, 0 ) <= 0) return 0;
-
-    return (p.revents & POLLIN) ? 1 : 0;
-}
-
 static int ipc_read_exact(int fd, void *buf, int len)
 {
     char *p = (char*) buf;
@@ -256,6 +270,33 @@ struct COMMADPT
     int read_ccw_count;
     int write_ccw_count;
     int unack_attn_count;
+
+#if defined(__GENODE__)
+    /*
+     * The attention path's own counters, reported by the device query so
+     * that `devlist` carries them. CUMULATIVE and never reset here, because
+     * a rate comes from differencing two samples over a bracketed window --
+     * a single reading of a counter that has been running since the IPL is
+     * a lifetime total and answers about no window at all.
+     *
+     * [0] is a poll that expired on its 10 ms timeout and [1] one that
+     * completed because a status byte arrived; the split is xlink_avail's
+     * own, taken from the same predicate it returned on. The time is a SUM
+     * of microseconds rather than a mean, for the same reason: two sums
+     * difference, two means do not.
+     *
+     * attn_poll_untracked exists because `xlink_poll_fd_stats` tracks only
+     * descriptors below its array bound and returns 0 for any other. Without
+     * this flag an out-of-range tag descriptor would print a table of zeros,
+     * which reads as "this poll never fires" -- a wrong answer in the
+     * believable direction out of a working instrument.
+     */
+    unsigned long      attn_poll_calls[2];
+    unsigned long long attn_poll_us[2];
+    unsigned long long attn_poll_max_us[2];
+    unsigned long      attn_raised;
+    int                attn_poll_untracked;
+#endif
 
     BYTE inpbuf[65536];
     int inpbufl;
@@ -788,6 +829,53 @@ static int commadpt_getaddr(in_addr_t *ia, char *txt) {
 }
 
 
+#if defined(__GENODE__)
+/*
+ * Drain this descriptor's row of the crosslink poll counters into the
+ * adapter, once per poll.
+ *
+ * EXACTLY ONE READER, DELIBERATELY. `xlink_poll_fd_stats` zeros the row it
+ * returns so that a reader cannot double count, which means a SECOND reader
+ * anywhere in this component would see zeros and print "nothing ever
+ * completes". The attention thread is that one reader for its own tag
+ * descriptor, it reads immediately after its own poll, and the device query
+ * below only ever reads the accumulated copy.
+ *
+ * Converting to microseconds here rather than at the printf keeps the sum
+ * independent of the calibration's timing: xlink_tsc_per_us() costs 100 ms
+ * on its first call, and that call lands on this thread before the first
+ * attention rather than inside a measured window.
+ */
+static void attn_poll_sample(COMMADPT *ca)
+{
+    unsigned long      calls = 0;
+    unsigned long long tsc = 0, max = 0;
+    unsigned long      out_calls[2] = { 0, 0 };
+    unsigned long long out_tsc[2]   = { 0, 0 };
+    unsigned long long out_max[2]   = { 0, 0 };
+    unsigned long long per_us;
+    int k;
+
+    if (!xlink_poll_fd_stats(ca->tagfd, &calls, &tsc, &max,
+                             out_calls, out_tsc, out_max)) {
+        ca->attn_poll_untracked = 1;
+        return;
+    }
+
+    per_us = xlink_tsc_per_us();
+
+    for (k = 0; k < 2; k++) {
+        unsigned long long const us     = out_tsc[k] / per_us;
+        unsigned long long const max_us = out_max[k] / per_us;
+
+        ca->attn_poll_calls[k] += out_calls[k];
+        ca->attn_poll_us[k]    += us;
+        if (max_us > ca->attn_poll_max_us[k])
+            ca->attn_poll_max_us[k] = max_us;
+    }
+}
+#endif
+
 /*-------------------------------------------------------------------*/
 /* CSW_adpt: Monitors sockets and handles Channel Status Words       */
 /*            from the remote channel adapter                        */
@@ -817,13 +905,21 @@ static void *CSW_adpt(void *vca) {
 
       while ((IsSocketConnected(ca->tagfd, ca->dev->ssid, ca->dev->devnum)) && !ca->dev->commadpt->attn_halt) {
 #if defined(__GENODE__)
-         /* Poll, then read. See ipc_avail: blocking here holds the libc
-            context that the emulator's 3270 consoles need, and VTAM then
-            never gets past activating them. 10 ms is far below any channel
-            timing and costs nothing measurable against an idle adapter. */
-         if (!ipc_avail(ca->tagfd)) {
-            usleep(10000);
-            continue;
+         /* Poll, then read. See the comment where ipc_avail used to be:
+            blocking here holds the libc context that the emulator's 3270
+            consoles need, and VTAM then never gets past activating them.
+            10 ms is far below any channel timing, and this poll is woken by
+            the crosslink rather than expiring, so an attention is raised
+            when its status byte arrives instead of at the next boundary.
+
+            The counters are drained whatever the outcome -- an expiring poll
+            is as much of a measurement as a completing one, and it is the
+            expiring ones that say whether the timed leg waits its timeout. */
+         {
+            int const ready = xlink_avail(ca->tagfd, 10);
+            attn_poll_sample(ca);
+            if (!ready)
+               continue;
          }
 #endif
          // Wait for Channel Adapter status byte
@@ -846,6 +942,14 @@ static void *CSW_adpt(void *vca) {
                  delay++;
               }
                    obtain_lock(&ca->dev->commadpt->lock);
+#if defined(__GENODE__)
+                   /* The denominator of the closed accounting: one
+                      completing poll, one status byte, one attention. If
+                      these two counts ever disagree, either a poll reported
+                      POLLIN for something that is not a status byte or some
+                      other reader is draining the tag descriptor. */
+                   ca->attn_raised++;
+#endif
                    rc_attn = device_attention(ca->dev, CSW_ATTN);  // Inject Attention
                    if (ca->dev->commadpt->debug)
                       logmsg("CCTAG009D %1d:%04X: Attention raised after %d us delay, rc=%d\n", ca->dev->ssid, ca->dev->devnum, delay, rc_attn);
@@ -1072,8 +1176,40 @@ static int commadpt_init_handler (DEVBLK *dev, int argc, char *argv[]) {
 static void commadpt_query_device (DEVBLK *dev, char **class,
                 int buflen, char *buffer) {
    *class = "LINE";
+#if defined(__GENODE__)
+   /*
+    * POLLATTN: the attention thread's crosslink poll, which nothing else in
+    * this project can see. Reached with Hercules' own `devlist`, which the
+    * measure harness already brackets a window with (MEASURE_DEVLIST=1 in
+    * port/genode/hercules_measure.inc) -- so a pair of these is a rate over
+    * exactly the window maxrates gives a peak for.
+    *
+    * Every figure is cumulative: rdy/exp calls, the SUM of microseconds in
+    * each, the high-water mark of each, and attentions raised. The Genode
+    * LOG truncates a line at 267 bytes and this has to share one with the
+    * device's own fields, so the names are short and nothing is a mean --
+    * the reader divides, which is also how it gets a windowed mean rather
+    * than a lifetime one.
+    */
+   if (dev->commadpt->attn_poll_untracked) {
+      snprintf(buffer, buflen,
+               "Read count=%d, Write count=%d, POLLATTN untracked fd=%d\n",
+               dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count,
+               dev->commadpt->tagfd);
+      return;
+   }
+   snprintf(buffer, buflen,
+            "Read count=%d, Write count=%d,"
+            " POLLATTN c=%lu/%lu us=%llu/%llu mx=%llu/%llu attn=%lu\n",
+            dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count,
+            dev->commadpt->attn_poll_calls[1], dev->commadpt->attn_poll_calls[0],
+            dev->commadpt->attn_poll_us[1], dev->commadpt->attn_poll_us[0],
+            dev->commadpt->attn_poll_max_us[1], dev->commadpt->attn_poll_max_us[0],
+            dev->commadpt->attn_raised);
+#else
    snprintf(buffer, buflen, "Read count=%d, Write count=%d\n",
            dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count);
+#endif
 }
 
 /*-------------------------------------------------------------------*/
