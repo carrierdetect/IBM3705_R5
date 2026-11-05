@@ -931,7 +931,16 @@ static void attn_probe(COMMADPT *ca)
 
         xlink_monq_stats(&passes, &examined, &completed, &exmax,
                          bin_count, bin_tsc, bin_max, bin_ahead);
-        ca->monq_passes    += passes;
+        /*
+         * `passes` IS NOT RESET BY THE READ and the other two are
+         * (kernel.cc:613 in the Genode fork: passes is assigned out,
+         * examined and completed are assigned out and zeroed). So passes is
+         * a SNAPSHOT and must be stored, not added: accumulating a running
+         * total once per probe set would print the sum of eight hundred
+         * readings of the same rising counter, which is a number with no
+         * meaning at all and no obvious sign of being wrong.
+         */
+        ca->monq_passes     = passes;
         ca->monq_examined  += examined;
         ca->monq_completed += completed;
     }
