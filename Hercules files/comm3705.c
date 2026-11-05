@@ -296,6 +296,39 @@ struct COMMADPT
     unsigned long long attn_poll_max_us[2];
     unsigned long      attn_raised;
     int                attn_poll_untracked;
+    /*
+     * SPLITTING THE EXPIRING POLL'S RESIDUE. The counters above price a whole
+     * xlink_avail and cannot split it; these three bare probes can, and the
+     * reasoning is registered in results/attn-poll-split-prediction.txt.
+     *
+     *   0  a bare zero-timeout poll, nfds ZERO, fired immediately after an
+     *      EXPIRING real poll -- one monitor round trip and nothing else,
+     *      because nfds 0 looks up no descriptor and poll_plugins returns 0
+     *      without touching a plugin.
+     *   1  a bare TIMED poll: a round trip plus the whole timed leg, since no
+     *      descriptor exists that could become ready and cut it short.
+     *   2  a bare zero-timeout poll immediately after 1, which is the
+     *      "woken while the entrypoint is still draining its queue" state.
+     *
+     * The probe tags are per-PROCESS -- static arrays inside each component's
+     * own copy of the xlink library -- so these three do not collide with the
+     * six the communications controller uses in its own component.
+     */
+    unsigned long      probe_calls[3];
+    unsigned long long probe_us[3];
+    unsigned long      attn_cycle;
+    /*
+     * The libc monitor queue's pass accounting, which is what says how many
+     * examination passes a timed leg actually gets. passes, examined and
+     * completed are NOT gated on <libc monitor_stats="yes"/> -- only the
+     * per-job timing bins are -- so reading them costs this partition nothing
+     * and needs no change to the scenario. They are a COMPONENT average over
+     * every monitor user in this partition, not this poll's own, which is
+     * why the prediction registers them as a sanity check and not as a test.
+     */
+    unsigned long long monq_passes;
+    unsigned long long monq_examined;
+    unsigned long long monq_completed;
 #endif
 
     BYTE inpbuf[65536];
@@ -846,6 +879,64 @@ static int commadpt_getaddr(in_addr_t *ia, char *txt) {
  * on its first call, and that call lands on this thread before the first
  * attention rather than inside a measured window.
  */
+/*
+ * ONE PROBE SET EVERY ATTN_PROBE_EVERY EXPIRING POLLS, AND THE INTERVAL IS
+ * NOT A TUNING CHOICE.
+ *
+ * A bare timed probe costs its whole timeout -- that is what it is for -- so
+ * firing one per cycle would double this thread's period and halve the rate
+ * the instrument is meant to measure. At one set every sixteen expiring polls
+ * the thread spends about 6% of its wall clock inside probe 1, `calls/s`
+ * falls from about 97 to about 91, and the registered control is that the real
+ * poll's EXPIRING MEAN must not move: if it does, the probe is loading the
+ * entrypoint it is trying to measure and the split is void.
+ *
+ * They fire only on the EXPIRING path, after the real poll has reported
+ * nothing. On the completing path the next thing to do is raise the attention,
+ * and delaying that by 10 ms would damage exactly the latency this poll was
+ * changed to improve.
+ */
+enum { ATTN_PROBE_EVERY = 16 };
+
+static void attn_probe(COMMADPT *ca)
+{
+    unsigned long long per_us;
+    int t;
+
+    if (++ca->attn_cycle % ATTN_PROBE_EVERY)
+        return;
+
+    xlink_poll_probe(0, 0);
+    xlink_poll_probe(1, 10);
+    xlink_poll_probe(2, 0);
+
+    per_us = xlink_tsc_per_us();
+
+    for (t = 0; t < 3; t++) {
+        unsigned long      calls = 0;
+        unsigned long long tsc = 0, max = 0;
+        /* which: 0 is the zero-timeout slot, 1 the timed one */
+        if (!xlink_poll_probe_stats(t, t == 1, &calls, &tsc, &max))
+            continue;
+        ca->probe_calls[t] += calls;
+        ca->probe_us[t]    += tsc / per_us;
+    }
+
+    {
+        unsigned long long passes = 0, examined = 0, completed = 0, exmax = 0;
+        unsigned long long bin_count[XLINK_MONQ_BINS];
+        unsigned long long bin_tsc[XLINK_MONQ_BINS];
+        unsigned long long bin_max[XLINK_MONQ_BINS];
+        unsigned long long bin_ahead[XLINK_MONQ_BINS];
+
+        xlink_monq_stats(&passes, &examined, &completed, &exmax,
+                         bin_count, bin_tsc, bin_max, bin_ahead);
+        ca->monq_passes    += passes;
+        ca->monq_examined  += examined;
+        ca->monq_completed += completed;
+    }
+}
+
 static void attn_poll_sample(COMMADPT *ca)
 {
     unsigned long      calls = 0;
@@ -918,8 +1009,10 @@ static void *CSW_adpt(void *vca) {
          {
             int const ready = xlink_avail(ca->tagfd, 10);
             attn_poll_sample(ca);
-            if (!ready)
+            if (!ready) {
+               attn_probe(ca);
                continue;
+            }
          }
 #endif
          // Wait for Channel Adapter status byte
@@ -1209,12 +1302,19 @@ static void commadpt_query_device (DEVBLK *dev, char **class,
    }
    snprintf(buffer, buflen,
             "Read count=%d, Write count=%d,"
-            " POLLATTN c=%lu/%lu us=%llu/%llu mx=%llu/%llu attn=%lu",
+            " POLLATTN c=%lu/%lu us=%llu/%llu mx=%llu/%llu attn=%lu"
+            " RT 0=%llu/%lu 1=%llu/%lu 2=%llu/%lu"
+            " MONQ p=%llu e=%llu c=%llu",
             dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count,
             dev->commadpt->attn_poll_calls[1], dev->commadpt->attn_poll_calls[0],
             dev->commadpt->attn_poll_us[1], dev->commadpt->attn_poll_us[0],
             dev->commadpt->attn_poll_max_us[1], dev->commadpt->attn_poll_max_us[0],
-            dev->commadpt->attn_raised);
+            dev->commadpt->attn_raised,
+            dev->commadpt->probe_us[0], dev->commadpt->probe_calls[0],
+            dev->commadpt->probe_us[1], dev->commadpt->probe_calls[1],
+            dev->commadpt->probe_us[2], dev->commadpt->probe_calls[2],
+            dev->commadpt->monq_passes, dev->commadpt->monq_examined,
+            dev->commadpt->monq_completed);
 #else
    snprintf(buffer, buflen, "Read count=%d, Write count=%d\n",
            dev->commadpt->read_ccw_count, dev->commadpt->write_ccw_count);
