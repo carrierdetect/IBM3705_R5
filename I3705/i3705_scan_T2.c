@@ -266,7 +266,40 @@ static inline uint64_t sp_tsc(void) { return __builtin_ia32_rdtsc(); }
    contention. The spin costs CPU and keeps the emulation timing the scanner
    exists to model; that trade is the point of the experiment. */
 static uint64_t sp_tsc_per_us;
+#if defined(__GENODE__)
+/*
+ * FOLDED, 2026-11-06. The measurement below was copied into the port as
+ * xlink_tsc_per_us() in port/genode/xlink/genode_xlink.c -- same method, same
+ * 100 ms, same floor -- and two copies of one measurement are two things to
+ * keep in step. Under Genode this calls that one and keeps only the printf,
+ * which is the part that genuinely belongs here: WHERE the result is reported
+ * is the scanner's business, its own trace destination; HOW it is measured is
+ * one measurement.
+ *
+ * genode_xlink.c is already compiled into this component
+ * (port/genode/i3705/target.mk), so this adds no dependency, and it is
+ * extern-declared rather than included for the same reason POLLRT's probe is
+ * a few lines above: that keeps the Genode-only surface of this file to the
+ * declarations themselves.
+ *
+ * The #else keeps the original body, which is NOT dead code -- the native
+ * build of this fork has no xlink to call, and a variable or a call that
+ * exists only under __GENODE__ and is reached outside it is how this fork's
+ * native build stayed broken for twenty days.
+ */
+extern unsigned long long xlink_tsc_per_us(void);
+extern unsigned long long xlink_tsc_calib_us(void);
+#endif
 static void sp_calibrate(void) {
+#if defined(__GENODE__)
+   /* The window comes back from the same calibration that produced the rate,
+      so the line below still reports what this component measured: the
+      scanner is that function's only caller in this component. */
+   sp_tsc_per_us = xlink_tsc_per_us();
+   printf(SP_CR "SCANPERF: calibrated %llu tsc/us over %llu us\n",
+          (unsigned long long)sp_tsc_per_us,
+          (unsigned long long)xlink_tsc_calib_us());
+#else
    /* Calibrate against the CLOCK, not against the length of a sleep. The
       first attempt divided by the sleep's ARGUMENT and got 2298 tsc/us on
       one run and 4329 on the next, because usleep(50000) does not take
@@ -285,6 +318,7 @@ static void sp_calibrate(void) {
    if (sp_tsc_per_us < 100) sp_tsc_per_us = 100;
    printf(SP_CR "SCANPERF: calibrated %llu tsc/us over %llu us\n",
           (unsigned long long)sp_tsc_per_us, (unsigned long long)us);
+#endif
 }
 /* The TSC rate in MHz, for every figure in this file that is quoted per
    second or per microsecond. Those divisors used to be literals: 1980 for
