@@ -113,6 +113,18 @@ latch fix in `455cdec` actually fires and then stop printing that count on
 every sample — printing it per sample cost 2.6% of the scanner's rate beside a
 core that was saturated, while the counting itself cost nothing measurable.
 
+`147314f` folds the time-stamp-counter calibration that `43a94b7` wired up
+into the Genode port's own copy of the same measurement. Both measure the TSC
+rate the same way — `CLOCK_MONOTONIC` read at both ends of a 100 ms sleep,
+never dividing by the sleep's argument, since that sleep not taking 100 ms is
+the thing being instrumented — and two copies of one measurement are two
+things to keep in step. Under `__GENODE__` the scanner now calls the port's
+function and keeps only its own report line, because where a figure is
+reported belongs to this file while how the rate is measured does not. The
+`#else` keeps the original body: the native build has no such function to
+call, and a call reachable outside the guard is how this branch's native build
+stayed broken for twenty days (`b84f773`'s own fix). Both arms were built.
+
 ### Housekeeping
 
 `a244e17` normalises line endings on two files. `ef31f4b` removes a
